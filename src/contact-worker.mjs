@@ -16,6 +16,12 @@ const NOT_CONFIRMED = 'We could not confirm your request was accepted. Your deta
 const VERIFICATION_UNAVAILABLE = 'Verification is unavailable. Please try again or contact Lavish directly.';
 const EXCEPTION_TYPES = new Set(['TypeError', 'RangeError', 'Error', 'AbortError', 'TimeoutError', 'OtherError']);
 const EXCEPTION_CODES = new Set(['CAPTCHA_REQUEST_ERROR', 'CAPTCHA_FETCH_ERROR', 'CAPTCHA_TIMEOUT', 'CAPTCHA_RESPONSE_INVALID']);
+// Ordered by diagnostic priority; unrecognized provider strings never escape.
+const PROVIDER_CODES = new Map([
+  ['missing-input-secret', 'configuration'], ['invalid-input-secret', 'configuration'],
+  ['missing-input-response', 'token'], ['invalid-input-response', 'token'], ['timeout-or-duplicate', 'token'],
+  ['bad-request', 'request'], ['internal-error', 'internal'], ['unknown', 'unknown'],
+]);
 
 class RequestError extends Error {
   constructor(status, message, code = 'VALIDATION_FAILED') {
@@ -42,10 +48,13 @@ function json(value, status = 200, extraHeaders = {}) {
 // upstream error text, or raw exceptions in a response or diagnostic log.
 // `not_sent` is only safe before invoking Resend. An attempted send with no
 // conclusive response is `unknown`; only an observed non-2xx is `rejected`.
-function failure(status, error, code, deliveryState = 'not_sent', headers, upstreamStatus, exceptionType) {
+function failure(status, error, code, deliveryState = 'not_sent', headers, upstreamStatus, exceptionType, providerCode) {
   const safeStatus = code === 'CAPTCHA_HTTP_ERROR' && Number.isInteger(upstreamStatus) && upstreamStatus >= 100 && upstreamStatus <= 599;
   const safeException = EXCEPTION_CODES.has(code) && EXCEPTION_TYPES.has(exceptionType);
-  return json({ ok: false, error, code, deliveryState, ...(safeStatus ? { upstreamStatus } : {}), ...(safeException ? { exceptionType } : {}) }, status, headers);
+  const safeProvider = code === 'CAPTCHA_HTTP_ERROR' && PROVIDER_CODES.has(providerCode);
+  return json({ ok: false, error, code, deliveryState, ...(safeStatus ? { upstreamStatus } : {}), ...(safeException ? { exceptionType } : {}),
+    ...(safeProvider ? { providerCode, providerCategory: PROVIDER_CODES.get(providerCode) } : {}),
+  }, status, headers);
 }
 function exceptionCategory(error) { return EXCEPTION_TYPES.has(error?.name) ? error.name : 'OtherError'; }
 function nonemptySetting(value, max = 256) {
@@ -88,7 +97,22 @@ function configuration(env) {
   return { enabled: Boolean(enabled), origins, from };
 }
 
-async function boundedJson(body, maximum = MAX_BODY_BYTES) {
+async function readChunk(reader, signal) {
+  if (!signal) return reader.read();
+  if (signal.aborted) throw signal.reason;
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      reject(signal.reason);
+      // Do not await cancellation of an unresponsive upstream stream.
+      void reader.cancel().catch(() => {});
+    };
+    signal.addEventListener('abort', abort, { once: true });
+    reader.read().then(value => { signal.removeEventListener('abort', abort); resolve(value); }, error => { signal.removeEventListener('abort', abort); reject(error); });
+  });
+}
+
+async function boundedJson(body, maximum = MAX_BODY_BYTES, signal) {
+  if (signal?.aborted) throw signal.reason;
   const length = body.headers.get('content-length');
   if (length !== null && (!/^\d+$/.test(length) || Number(length) > maximum)) {
     throw new RequestError(413, 'This request is too large. Please shorten your details.', 'BODY_TOO_LARGE');
@@ -99,11 +123,11 @@ async function boundedJson(body, maximum = MAX_BODY_BYTES) {
   const chunks = [];
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const { done, value } = await readChunk(reader, signal);
       if (done) break;
       size += value.byteLength;
       if (size > maximum) {
-        await reader.cancel();
+        void reader.cancel().catch(() => {});
         throw new RequestError(413, 'This request is too large. Please shorten your details.', 'BODY_TOO_LARGE');
       }
       chunks.push(value);
@@ -159,6 +183,15 @@ function verificationTimeout(error, signal) {
   return signal?.aborted === true || error?.name === 'AbortError' || error?.name === 'TimeoutError';
 }
 
+async function providerDiagnostic(response, signal) {
+  try {
+    const body = await boundedJson(response, MAX_UPSTREAM_BYTES, signal);
+    const codes = body && typeof body === 'object' && !Array.isArray(body) && Array.isArray(body['error-codes']) ? body['error-codes'] : [];
+    for (const code of PROVIDER_CODES.keys()) if (codes.includes(code)) return code;
+  } catch { /* HTTP failure remains a failure even if its body cannot be read. */ }
+  return 'unknown';
+}
+
 // One shared Siteverify implementation for contact and the no-email diagnostic.
 // Only fixed categories and an HTTP status may escape this boundary.
 async function verifyTurnstile(data, ip, hostname, env, fetchImpl) {
@@ -181,7 +214,10 @@ async function verifyTurnstile(data, ip, hostname, env, fetchImpl) {
     || response.ok !== (response.status >= 200 && response.status < 300)) {
     return failure(503, VERIFICATION_UNAVAILABLE, 'CAPTCHA_RESPONSE_INVALID');
   }
-  if (!response.ok) return failure(503, VERIFICATION_UNAVAILABLE, 'CAPTCHA_HTTP_ERROR', 'not_sent', undefined, response.status);
+  if (!response.ok) {
+    const providerCode = await providerDiagnostic(response, options.signal);
+    return failure(503, VERIFICATION_UNAVAILABLE, 'CAPTCHA_HTTP_ERROR', 'not_sent', undefined, response.status, undefined, providerCode);
+  }
 
   let verification;
   try { verification = await boundedJson(response, MAX_UPSTREAM_BYTES); }
@@ -253,7 +289,7 @@ export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
 
       if (url.pathname === '/api/contact-config') {
         if (request.method !== 'GET') return failure(405, 'Method not allowed.', 'METHOD_NOT_ALLOWED', 'not_sent', { Allow: 'GET' });
-        return json({ enabled: config.enabled, recipient: RECIPIENT, diagnosticsVersion: 2, ...(config.enabled ? { siteKey: env.TURNSTILE_SITE_KEY } : {}) });
+        return json({ enabled: config.enabled, recipient: RECIPIENT, diagnosticsVersion: 3, ...(config.enabled ? { siteKey: env.TURNSTILE_SITE_KEY } : {}) });
       }
       if (request.method !== 'POST') return failure(405, 'Method not allowed.', 'METHOD_NOT_ALLOWED', 'not_sent', { Allow: 'POST' });
       if (request.headers.get('origin') !== url.origin

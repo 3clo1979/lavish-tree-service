@@ -119,3 +119,13 @@ test('granular verification diagnostics show only safe status or exception categ
   assert.match(describeDeliveryFailure({code:'CAPTCHA_FETCH_ERROR',deliveryState:'not_sent',exceptionType:'TypeError'}),/CAPTCHA_FETCH_ERROR \(TypeError\)/);
   for(const value of [{code:'CAPTCHA_HTTP_ERROR',deliveryState:'not_sent',upstreamStatus:'sensitive'},{code:'CAPTCHA_FETCH_ERROR',deliveryState:'not_sent',exceptionType:'sensitive'}])assert.ok(!describeDeliveryFailure(value).includes('sensitive'));
 });
+
+test('HTTP provider classification displays only the fixed diagnostic enum',()=>{
+ assert.match(describeDeliveryFailure({code:'CAPTCHA_HTTP_ERROR',deliveryState:'not_sent',upstreamStatus:400,providerCategory:'configuration'}),/HTTP 400.*category: configuration/);
+ assert.ok(!describeDeliveryFailure({code:'CAPTCHA_HTTP_ERROR',deliveryState:'not_sent',providerCategory:'sensitive value'}).includes('sensitive'));
+});
+
+test('provider error code is chosen from the fixed documented allowlist only',()=>{
+ assert.match(describeDeliveryFailure({code:'CAPTCHA_HTTP_ERROR',deliveryState:'not_sent',upstreamStatus:400,providerCode:'invalid-input-secret'}),/provider: invalid-input-secret/);
+ assert.ok(!describeDeliveryFailure({code:'CAPTCHA_HTTP_ERROR',deliveryState:'not_sent',providerCode:'sensitive value'}).includes('sensitive'));
+});

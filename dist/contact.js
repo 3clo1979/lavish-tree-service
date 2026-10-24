@@ -42,6 +42,8 @@ export function safeFailureReference(result) {
   let reference = result.code;
   if (result.code === 'CAPTCHA_HTTP_ERROR' && Number.isInteger(result.upstreamStatus) && result.upstreamStatus >= 100 && result.upstreamStatus <= 599) reference += ` (HTTP ${result.upstreamStatus})`;
   if (['CAPTCHA_REQUEST_ERROR', 'CAPTCHA_FETCH_ERROR', 'CAPTCHA_TIMEOUT', 'CAPTCHA_RESPONSE_INVALID'].includes(result.code) && ['TypeError', 'RangeError', 'Error', 'AbortError', 'TimeoutError', 'OtherError'].includes(result.exceptionType)) reference += ` (${result.exceptionType})`;
+  if (result.code === 'CAPTCHA_HTTP_ERROR' && ['configuration','token','request','internal','unknown'].includes(result.providerCategory)) reference += ` [category: ${result.providerCategory}]`;
+  if (result.code === 'CAPTCHA_HTTP_ERROR' && ['missing-input-secret','invalid-input-secret','missing-input-response','invalid-input-response','timeout-or-duplicate','bad-request','internal-error','unknown'].includes(result.providerCode)) reference += ` [provider: ${result.providerCode}]`;
   return reference;
 }
 export function describeDeliveryFailure(result) {

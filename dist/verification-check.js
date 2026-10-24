@@ -6,6 +6,8 @@ export function describeVerificationResult(result) {
   let reference = result.code;
   if (result.code === 'CAPTCHA_HTTP_ERROR' && Number.isInteger(result.upstreamStatus) && result.upstreamStatus >= 100 && result.upstreamStatus <= 599) reference += ` (HTTP ${result.upstreamStatus})`;
   if (['CAPTCHA_REQUEST_ERROR','CAPTCHA_FETCH_ERROR','CAPTCHA_TIMEOUT','CAPTCHA_RESPONSE_INVALID'].includes(result.code) && ['TypeError','RangeError','Error','AbortError','TimeoutError','OtherError'].includes(result.exceptionType)) reference += ` (${result.exceptionType})`;
+  if (result.code === 'CAPTCHA_HTTP_ERROR' && ['configuration','token','request','internal','unknown'].includes(result.providerCategory)) reference += ` [category: ${result.providerCategory}]`;
+  if (result.code === 'CAPTCHA_HTTP_ERROR' && ['missing-input-secret','invalid-input-secret','missing-input-response','invalid-input-response','timeout-or-duplicate','bad-request','internal-error','unknown'].includes(result.providerCode)) reference += ` [provider: ${result.providerCode}]`;
   return `Verification did not pass. No email was sent. Reference: ${reference}.`;
 }
 export async function initializeVerificationCheck({document,window,fetch = window.fetch.bind(window)}) {
@@ -20,7 +22,7 @@ export async function initializeVerificationCheck({document,window,fetch = windo
     const response = await fetch('/api/contact-config',{cache:'no-store',headers:{Accept:'application/json'}});
     if (!response.ok) throw new Error('Configuration unavailable');
     config = await response.json();
-    if (config?.enabled !== true || config.diagnosticsVersion !== 2 || config.recipient !== 'sales@lavishtreeservice.com' || typeof config.siteKey !== 'string' || !/^[A-Za-z0-9_-]{10,100}$/.test(config.siteKey)) throw new Error('Configuration not ready');
+    if (config?.enabled !== true || config.diagnosticsVersion !== 3 || config.recipient !== 'sales@lavishtreeservice.com' || typeof config.siteKey !== 'string' || !/^[A-Za-z0-9_-]{10,100}$/.test(config.siteKey)) throw new Error('Configuration not ready');
   } catch { say('The verification diagnostic is not ready. No email was sent.'); return false; }
   let token = '', pending = false, widgetId, resultShown = false;
   const refresh = () => { button.disabled = pending || !token; };

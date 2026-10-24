@@ -52,7 +52,7 @@ function fixture(overrides = {}) {
 test('disabled by default and never calls an upstream provider', async () => {
   const f = fixture({ CONTACT_FORM_ENABLED: undefined });
   const config = await f.worker.fetch(request(null, { method: 'GET', path: '/api/contact-config' }), f.env);
-  assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT, diagnosticsVersion: 2 });
+  assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT, diagnosticsVersion: 3 });
   assert.equal((await f.worker.fetch(request(), f.env)).status, 503);
   assert.equal(f.calls.length, 0);
   assert.equal(f.rateCalls.length, 0);
@@ -61,7 +61,7 @@ test('disabled by default and never calls an upstream provider', async () => {
 test('enabled configuration exposes only public settings, never secrets or sender', async () => {
   const f = fixture();
   const response = await f.worker.fetch(request(null, { method: 'GET', path: '/api/contact-config' }), f.env);
-  assert.deepEqual(await response.json(), { enabled: true, recipient: RECIPIENT, diagnosticsVersion: 2, siteKey: 'mock-public-site-key' });
+  assert.deepEqual(await response.json(), { enabled: true, recipient: RECIPIENT, diagnosticsVersion: 3, siteKey: 'mock-public-site-key' });
   assert.equal(response.headers.get('cache-control'), 'no-store');
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('access-control-allow-origin'), null);
@@ -86,7 +86,7 @@ for (const [name, patch] of [
     const f = fixture(patch);
     assert.equal((await f.worker.fetch(request(), f.env)).status, 503);
     const config = await f.worker.fetch(request(null, { method: 'GET', path: '/api/contact-config' }), f.env);
-    assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT, diagnosticsVersion: 2 });
+    assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT, diagnosticsVersion: 3 });
     assert.equal(f.calls.length, 0);
   });
 }
@@ -370,7 +370,7 @@ for (const [name, options] of [
   ['failed rate binding', { env: { CONTACT_RATE_LIMITER: { async limit() { throw new Error('private binding failure'); } } }, status: 503, code: 'RATE_LIMIT_BINDING_UNAVAILABLE' }],
   ['malformed rate result', { env: { CONTACT_RATE_LIMITER: { async limit() { return {}; } } }, status: 503, code: 'RATE_LIMIT_BINDING_UNAVAILABLE' }],
   ['rate limited', { env: { CONTACT_RATE_LIMITER: { async limit() { return { success: false }; } } }, status: 429, code: 'RATE_LIMITED' }],
-  ['CAPTCHA HTTP failure', { verify: () => new Response('private provider failure', { status: 500 }), status: 503, code: 'CAPTCHA_HTTP_ERROR', upstreamStatus: 500 }],
+  ['CAPTCHA HTTP failure', { verify: () => new Response('private provider failure', { status: 500 }), status: 503, code: 'CAPTCHA_HTTP_ERROR', upstreamStatus: 500, providerCode: 'unknown', providerCategory: 'unknown' }],
   ['CAPTCHA connection failure', { verify: () => { throw new Error('private upstream error'); }, status: 503, code: 'CAPTCHA_FETCH_ERROR', exceptionType: 'Error' }],
   ['CAPTCHA bad JSON', { verify: () => new Response('{bad'), status: 503, code: 'CAPTCHA_RESPONSE_INVALID', exceptionType: 'Error' }],
   ['CAPTCHA internal error category', { verify: () => Response.json({ success: false, 'error-codes': ['internal-error'] }), status: 503, code: 'CAPTCHA_PROVIDER_ERROR' }],
@@ -387,9 +387,11 @@ for (const [name, options] of [
     const response = await f.worker.fetch(request({ ...sample(), ...options.body }, options.request), f.env);
     assert.equal(response.status, options.status);
     const result = await response.json();
-    assert.deepEqual(Object.keys(result).sort(), ['code', 'deliveryState', 'error', 'ok', ...(options.upstreamStatus ? ['upstreamStatus'] : []), ...(options.exceptionType ? ['exceptionType'] : [])].sort());
+    assert.deepEqual(Object.keys(result).sort(), ['code', 'deliveryState', 'error', 'ok', ...(options.upstreamStatus ? ['upstreamStatus'] : []), ...(options.exceptionType ? ['exceptionType'] : []), ...(options.providerCode ? ['providerCode', 'providerCategory'] : [])].sort());
     assert.equal(result.upstreamStatus, options.upstreamStatus);
     assert.equal(result.exceptionType, options.exceptionType);
+    assert.equal(result.providerCode, options.providerCode);
+    assert.equal(result.providerCategory, options.providerCategory);
     assert.equal(result.ok, false);
     assert.equal(result.code, options.code);
     assert.equal(result.deliveryState, 'not_sent');
@@ -643,3 +645,83 @@ for (const [name, providerResponse, code] of [
     assert.deepEqual(f.calls.map(call => call.url), ['https://challenges.cloudflare.com/turnstile/v0/siteverify']);
   });
 }
+
+for (const [providerCode, providerCategory] of [
+  ['missing-input-secret', 'configuration'], ['invalid-input-secret', 'configuration'],
+  ['missing-input-response', 'token'], ['invalid-input-response', 'token'], ['timeout-or-duplicate', 'token'],
+  ['bad-request', 'request'], ['internal-error', 'internal'], ['unknown', 'unknown'],
+]) {
+  test(`HTTP failure exposes only fixed provider code ${providerCode} and category`, async () => {
+    for (const path of ['/api/contact', '/api/contact-verify']) {
+      const f = fixture();
+      f.setVerify(() => Response.json({ success: false, 'error-codes': [providerCode], private: 'private upstream details' }, { status: 400 }));
+      const req = path === '/api/contact' ? request() : verificationRequest();
+      const response = await f.worker.fetch(req, f.env);
+      const result = await response.json();
+      assert.equal(response.status, 503);
+      assert.deepEqual(result, {
+        ok: false, error: 'Verification is unavailable. Please try again or contact Lavish directly.',
+        code: 'CAPTCHA_HTTP_ERROR', deliveryState: 'not_sent', upstreamStatus: 400, providerCode, providerCategory,
+      });
+      assert.equal(f.calls.length, 1);
+      assert.ok(f.calls.every(call => call.url !== 'https://api.resend.com/emails'));
+      assert.ok(!JSON.stringify(result).includes('private'));
+    }
+  });
+}
+
+test('configuration code takes priority over other allowlisted provider categories', async () => {
+  const f = fixture();
+  f.setVerify(() => Response.json({ 'error-codes': ['internal-error', 'bad-request', 'invalid-input-response', 'invalid-input-secret'] }, { status: 400 }));
+  const result = await (await f.worker.fetch(verificationRequest(), f.env)).json();
+  assert.equal(result.providerCode, 'invalid-input-secret');
+  assert.equal(result.providerCategory, 'configuration');
+  assert.equal(result.code, 'CAPTCHA_HTTP_ERROR');
+  assert.equal(result.upstreamStatus, 400);
+  assert.equal(f.calls.length, 1);
+});
+
+for (const [name, responseFactory] of [
+  ['unrecognized provider data', () => Response.json({ 'error-codes': ['private-secret-value'], private: 'private customer data' }, { status: 400 })],
+  ['nonarray error codes', () => Response.json({ 'error-codes': 'invalid-input-secret' }, { status: 400 })],
+  ['nested arbitrary objects', () => Response.json({ 'error-codes': [{ private: 'private data' }] }, { status: 400 })],
+  ['malformed JSON', () => new Response('{private', { status: 400 })],
+  ['HTML body', () => new Response('<html>private error</html>', { status: 400 })],
+  ['null body', () => new Response(null, { status: 400 })],
+  ['oversized body', () => Response.json({ 'error-codes': ['invalid-input-secret'], padding: 'x'.repeat(16_385) }, { status: 400 })],
+  ['misleading success body', () => Response.json({ success: true, hostname: HOST, action: 'contact' }, { status: 400 })],
+]) {
+  test(`non-2xx ${name} stays HTTP_ERROR/unknown with no Resend`, async () => {
+    const f = fixture(); f.setVerify(responseFactory);
+    const result = await (await f.worker.fetch(verificationRequest(), f.env)).json();
+    assert.equal(result.code, 'CAPTCHA_HTTP_ERROR');
+    assert.equal(result.upstreamStatus, 400);
+    assert.equal(result.providerCode, 'unknown');
+    assert.equal(result.providerCategory, 'unknown');
+    assert.equal(result.deliveryState, 'not_sent');
+    assert.equal(f.calls.length, 1);
+    assert.ok(!JSON.stringify(result).includes('private'));
+  });
+}
+
+test('non-2xx body uses existing CAPTCHA deadline, cancels a stalled read, and stays HTTP_ERROR/unknown', async t => {
+  const controller = new AbortController();
+  const durations = [];
+  t.mock.method(AbortSignal, 'timeout', duration => { durations.push(duration); return controller.signal; });
+  const f = fixture();
+  let cancelled = false;
+  f.setVerify(() => {
+    setTimeout(() => controller.abort(new DOMException('private timeout detail', 'TimeoutError')), 5);
+    return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 400 });
+  });
+  const result = await (await f.worker.fetch(verificationRequest(), f.env)).json();
+  assert.deepEqual(durations, [8000]);
+  assert.equal(result.code, 'CAPTCHA_HTTP_ERROR');
+  assert.equal(result.upstreamStatus, 400);
+  assert.equal(result.providerCode, 'unknown');
+  assert.equal(result.providerCategory, 'unknown');
+  assert.equal(result.deliveryState, 'not_sent');
+  assert.equal(cancelled, true);
+  assert.equal(f.calls.length, 1);
+  assert.ok(!JSON.stringify(result).includes('private'));
+});
