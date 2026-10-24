@@ -13,7 +13,7 @@
     "CONTACT_FORM_ENABLED": "true",
     "CONTACT_FROM": "webforms@notify.lavishtreeservice.com",
     "CONTACT_ALLOWED_ORIGINS": "https://lavishtreeservice.com,https://www.lavishtreeservice.com",
-    "TURNSTILE_SITE_KEY": "0x4AAAAAAAFkHs_2LwMRbnnLJ"
+    "TURNSTILE_SITE_KEY": "0x4AAAAAAFkHs_2LwMRbnnLJ"
   },
   "ratelimits": [
     {

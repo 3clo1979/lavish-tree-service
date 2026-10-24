@@ -24,7 +24,7 @@ The implementation integrates the Worker, public readiness client, CSP and asset
   "vars": {
     "CONTACT_FORM_ENABLED": "false",
     "CONTACT_FROM": "webforms@notify.lavishtreeservice.com",
-    "TURNSTILE_SITE_KEY": "0x4AAAAAAAFkHs_2LwMRbnnLJ"
+    "TURNSTILE_SITE_KEY": "0x4AAAAAAFkHs_2LwMRbnnLJ"
   },
   "ratelimits": [{
     "name": "CONTACT_RATE_LIMITER",
