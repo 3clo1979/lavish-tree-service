@@ -5,6 +5,13 @@
  */
 const RECIPIENT = 'sales@lavishtreeservice.com';
 const PREVIEW_ORIGIN = 'https://lavish-tree-service.3clo1979.workers.dev';
+const PUBLIC_ORIGIN = 'https://lavishtreeservice.com';
+const SITE_SECURITY_HEADERS = {
+  'X-Content-Type-Options': 'nosniff',
+  'Referrer-Policy': 'strict-origin-when-cross-origin',
+  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  'Content-Security-Policy': "default-src 'self'; img-src 'self'; font-src 'self'; style-src 'self'; script-src 'self' https://challenges.cloudflare.com; frame-src https://challenges.cloudflare.com; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'",
+};
 const FUTURE_ORIGINS = new Set(['https://lavishtreeservice.com', 'https://www.lavishtreeservice.com']);
 const SERVICES = new Set(['Tree removal', 'Tree trimming', 'Stump grinding', 'Storm response', 'Not sure yet']);
 const FIELDS = new Set(['name', 'phone', 'email', 'service', 'address', 'message', 'website', 'turnstileToken', 'submissionId']);
@@ -169,16 +176,6 @@ function validate(body) {
   return data;
 }
 
-function validateVerificationOnly(body) {
-  if (!body || typeof body !== 'object' || Array.isArray(body)
-    || Object.keys(body).length !== 1 || !Object.hasOwn(body, 'turnstileToken')
-    || typeof body.turnstileToken !== 'string' || body.turnstileToken.length === 0
-    || body.turnstileToken.length > 2048 || /[\s\x00-\x1f\x7f]/.test(body.turnstileToken)) {
-    throw new RequestError(400, 'Please complete the verification before checking.');
-  }
-  return { turnstileToken: body.turnstileToken };
-}
-
 function verificationTimeout(error, signal) {
   return signal?.aborted === true || error?.name === 'AbortError' || error?.name === 'TimeoutError';
 }
@@ -192,7 +189,7 @@ async function providerDiagnostic(response, signal) {
   return 'unknown';
 }
 
-// One shared Siteverify implementation for contact and the no-email diagnostic.
+// Bounded server-side Siteverify validation for contact requests.
 // Only fixed categories and an HTTP status may escape this boundary.
 async function verifyTurnstile(data, ip, hostname, env, fetchImpl) {
   let options;
@@ -271,25 +268,95 @@ function emailPayload(data, from) {
   return payload;
 }
 
+function siteHeaders(original, indexable = false) {
+  const headers = new Headers(original);
+  for (const [key, value] of Object.entries(SITE_SECURITY_HEADERS)) headers.set(key, value);
+  if (indexable) headers.delete('X-Robots-Tag');
+  else headers.set('X-Robots-Tag', 'noindex, nofollow');
+  return headers;
+}
+
+function crawlerResponse(request, url) {
+  if (!['/robots.txt', '/sitemap.xml'].includes(url.pathname)) return null;
+  const publicHost = url.origin === PUBLIC_ORIGIN;
+  const headers = siteHeaders(undefined, publicHost);
+  headers.set('Cache-Control', 'no-store');
+  if (!['GET', 'HEAD'].includes(request.method)) {
+    headers.set('Allow', 'GET, HEAD');
+    return new Response(null, { status: 405, headers });
+  }
+  if (url.pathname === '/robots.txt') {
+    headers.set('Content-Type', 'text/plain; charset=utf-8');
+    const body = publicHost
+      ? `User-agent: *\nAllow: /\nDisallow: /api/\nSitemap: ${PUBLIC_ORIGIN}/sitemap.xml\n`
+      : 'User-agent: *\nDisallow: /\n';
+    return new Response(request.method === 'HEAD' ? null : body, { headers });
+  }
+  if (!publicHost) {
+    headers.set('Content-Type', 'text/plain; charset=utf-8');
+    return new Response(request.method === 'HEAD' ? null : 'Not found', { status: 404, headers });
+  }
+  headers.set('Content-Type', 'application/xml; charset=utf-8');
+  const body = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>${PUBLIC_ORIGIN}/</loc></url></urlset>\n`;
+  return new Response(request.method === 'HEAD' ? null : body, { headers });
+}
+
+async function serveSiteAsset(request, url, env) {
+  if (typeof env.ASSETS?.fetch !== 'function') return new Response('Not found', { status: 404, headers: siteHeaders() });
+  const publicHost = url.origin === PUBLIC_ORIGIN;
+  let assetRequest = request;
+  // Source validators/ranges refer to preview HTML, not the rewritten public page.
+  const pagePath = !url.pathname.split('/').at(-1).includes('.') || /\.html?$/i.test(url.pathname);
+  if (publicHost && pagePath && ['GET', 'HEAD'].includes(request.method)) {
+    const headers = new Headers(request.headers);
+    for (const name of ['If-None-Match', 'If-Modified-Since', 'If-Match', 'If-Unmodified-Since', 'Range', 'If-Range']) headers.delete(name);
+    headers.set('Accept-Encoding', 'identity');
+    assetRequest = new Request(request, { headers });
+  }
+  const response = await env.ASSETS.fetch(assetRequest);
+  const html = /^text\/html\b/i.test(response.headers.get('Content-Type') || '');
+  const headers = siteHeaders(response.headers, publicHost && response.ok);
+  if (!publicHost || !html || response.status !== 200 || !['GET', 'HEAD'].includes(request.method)) {
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  }
+  // Fail closed if the assets service unexpectedly ignores identity encoding.
+  const encoding = response.headers.get('Content-Encoding');
+  if (encoding && encoding !== 'identity') {
+    headers.set('X-Robots-Tag', 'noindex, nofollow');
+    return new Response(response.body, { status: response.status, headers });
+  }
+  for (const name of ['Content-Length', 'ETag', 'Last-Modified', 'Content-MD5', 'Digest', 'Content-Digest', 'Repr-Digest', 'Accept-Ranges', 'Content-Range', 'Content-Encoding']) headers.delete(name);
+  headers.set('Cache-Control', 'no-store');
+  if (request.method === 'HEAD') return new Response(null, { status: 200, headers });
+  // Built-in streaming parser; source HTML stays noindex for every other host.
+  return new HTMLRewriter().on('meta', {
+    element(element) {
+      if (element.getAttribute('name')?.toLowerCase() === 'robots') element.remove();
+    },
+  }).transform(new Response(response.body, { status: 200, headers }));
+}
+
 export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
   return {
     async fetch(request, env = {}) {
       const url = new URL(request.url);
-      if (!url.pathname.startsWith('/api/')) {
-        return typeof env.ASSETS?.fetch === 'function'
-          ? env.ASSETS.fetch(request)
-          : new Response('Not found', { status: 404 });
+      // Canonical host only: do not trust forwarded/Host headers or match suffixes.
+      if (url.hostname === 'www.lavishtreeservice.com' || url.origin === 'http://lavishtreeservice.com') {
+        return Response.redirect(`https://lavishtreeservice.com${url.pathname}${url.search}`, 308);
       }
-      if (!['/api/contact', '/api/contact-config', '/api/contact-verify'].includes(url.pathname)) return failure(404, 'Not found.', 'NOT_FOUND');
-      const verificationOnly = url.pathname === '/api/contact-verify';
-      if (verificationOnly && url.origin !== PREVIEW_ORIGIN) return failure(403, 'This request is not allowed.', 'ORIGIN_NOT_ALLOWED');
+      const crawler = crawlerResponse(request, url);
+      if (crawler) return crawler;
+      if (!url.pathname.startsWith('/api/')) {
+        return serveSiteAsset(request, url, env);
+      }
+      if (!['/api/contact', '/api/contact-config'].includes(url.pathname)) return failure(404, 'Not found.', 'NOT_FOUND');
       const config = configuration(env);
       if (!config.origins) return failure(403, 'This request is not allowed.', 'CONFIG_NOT_READY');
       if (!config.origins.has(url.origin)) return failure(403, 'This request is not allowed.', 'ORIGIN_NOT_ALLOWED');
 
       if (url.pathname === '/api/contact-config') {
         if (request.method !== 'GET') return failure(405, 'Method not allowed.', 'METHOD_NOT_ALLOWED', 'not_sent', { Allow: 'GET' });
-        return json({ enabled: config.enabled, recipient: RECIPIENT, diagnosticsVersion: 3, ...(config.enabled ? { siteKey: env.TURNSTILE_SITE_KEY } : {}) });
+        return json({ enabled: config.enabled, recipient: RECIPIENT, ...(config.enabled ? { siteKey: env.TURNSTILE_SITE_KEY } : {}) });
       }
       if (request.method !== 'POST') return failure(405, 'Method not allowed.', 'METHOD_NOT_ALLOWED', 'not_sent', { Allow: 'POST' });
       if (request.headers.get('origin') !== url.origin
@@ -317,12 +384,9 @@ export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
         if (typeof rate?.success !== 'boolean') return failure(503, UNAVAILABLE, 'RATE_LIMIT_BINDING_UNAVAILABLE');
         if (!rate.success) return failure(429, 'Too many attempts. Please wait one minute or contact Lavish directly.', 'RATE_LIMITED', 'not_sent', { 'Retry-After': '60' });
         const body = await boundedJson(request);
-        const data = verificationOnly ? validateVerificationOnly(body) : validate(body);
+        const data = validate(body);
         const verificationFailure = await verifyTurnstile(data, ip, url.hostname, env, fetchImpl);
         if (verificationFailure) return verificationFailure;
-        // Structurally exit before creating any email or reaching the Resend code.
-        if (verificationOnly) return json({ ok: true, verified: true, deliveryState: 'not_sent' });
-
         const payload = JSON.stringify(emailPayload(data, config.from));
         // Stable for unchanged entries + submission UUID, even after a fresh CAPTCHA.
         // Resend retains its idempotency record for 24 hours; this is not a permanent ledger.

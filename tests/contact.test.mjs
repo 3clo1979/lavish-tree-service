@@ -52,7 +52,7 @@ function fixture(overrides = {}) {
 test('disabled by default and never calls an upstream provider', async () => {
   const f = fixture({ CONTACT_FORM_ENABLED: undefined });
   const config = await f.worker.fetch(request(null, { method: 'GET', path: '/api/contact-config' }), f.env);
-  assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT, diagnosticsVersion: 3 });
+  assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT });
   assert.equal((await f.worker.fetch(request(), f.env)).status, 503);
   assert.equal(f.calls.length, 0);
   assert.equal(f.rateCalls.length, 0);
@@ -61,7 +61,7 @@ test('disabled by default and never calls an upstream provider', async () => {
 test('enabled configuration exposes only public settings, never secrets or sender', async () => {
   const f = fixture();
   const response = await f.worker.fetch(request(null, { method: 'GET', path: '/api/contact-config' }), f.env);
-  assert.deepEqual(await response.json(), { enabled: true, recipient: RECIPIENT, diagnosticsVersion: 3, siteKey: 'mock-public-site-key' });
+  assert.deepEqual(await response.json(), { enabled: true, recipient: RECIPIENT, siteKey: 'mock-public-site-key' });
   assert.equal(response.headers.get('cache-control'), 'no-store');
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('access-control-allow-origin'), null);
@@ -86,7 +86,7 @@ for (const [name, patch] of [
     const f = fixture(patch);
     assert.equal((await f.worker.fetch(request(), f.env)).status, 503);
     const config = await f.worker.fetch(request(null, { method: 'GET', path: '/api/contact-config' }), f.env);
-    assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT, diagnosticsVersion: 3 });
+    assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT });
     assert.equal(f.calls.length, 0);
   });
 }
@@ -132,7 +132,7 @@ for (const [name, options] of [
   });
 }
 
-for (const origin of ['https://lavishtreeservice.com', 'https://www.lavishtreeservice.com']) test(`custom domain ${origin} needs exact allowlist and matching CAPTCHA hostname`, async () => {
+for (const origin of ['https://lavishtreeservice.com']) test(`custom domain ${origin} needs exact allowlist and matching CAPTCHA hostname`, async () => {
   const f = fixture();
   assert.equal((await f.worker.fetch(request(sample(), { urlOrigin: origin, origin }), f.env)).status, 403);
   f.env.CONTACT_ALLOWED_ORIGINS = origin;
@@ -560,102 +560,16 @@ test('valid streamed Siteverify JSON works with split UTF-8 chunks and real HTTP
   assert.equal(f.calls.length, 2);
 });
 
-const verificationRequest = (body = { turnstileToken: 'local-mock-token' }, options = {}) => request(body, { path: '/api/contact-verify', ...options });
-
-test('verification-only success structurally exits before email construction and Resend', async () => {
-  const f = fixture();
-  f.setSend(() => { throw new Error('Resend must never be reached'); });
-  const response = await f.worker.fetch(verificationRequest(), f.env);
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true, verified: true, deliveryState: 'not_sent' });
-  assert.deepEqual(f.calls.map(call => call.url), ['https://challenges.cloudflare.com/turnstile/v0/siteverify']);
-  assert.equal(f.rateCalls.length, 1);
-  assert.deepEqual(Object.keys(JSON.parse(f.calls[0].init.body)).sort(), ['remoteip', 'response', 'secret']);
-});
-
-for (const origin of ['https://lavishtreeservice.com', 'https://www.lavishtreeservice.com', 'https://other.workers.dev', ORIGIN.replace('https:', 'http:')]) {
-  test(`verification-only endpoint is denied on ${origin} even when normal custom origins are enabled`, async () => {
-    const f = fixture({ CONTACT_ALLOWED_ORIGINS: 'https://lavishtreeservice.com,https://www.lavishtreeservice.com' });
-    const response = await f.worker.fetch(verificationRequest(undefined, { urlOrigin: origin, origin }), f.env);
-    const result = await response.json();
-    assert.equal(response.status, 403);
-    assert.equal(result.code, 'ORIGIN_NOT_ALLOWED');
-    assert.equal(result.deliveryState, 'not_sent');
-    assert.equal(f.calls.length, 0);
-  });
-}
-
-for (const [name, body] of [
-  ['missing token', {}], ['null', null], ['array', []], ['empty token', { turnstileToken: '' }],
-  ['whitespace token', { turnstileToken: ' ' }], ['numeric token', { turnstileToken: 123 }],
-  ['oversized token', { turnstileToken: 'x'.repeat(2049) }],
-  ['contact fields', { ...sample() }],
-  ['email recipient', { turnstileToken: 'local-mock-token', to: RECIPIENT }],
-  ['customer data', { turnstileToken: 'local-mock-token', email: 'customer@example.com' }],
-  ['send switch', { turnstileToken: 'local-mock-token', send: true }],
-]) {
-  test(`verification-only rejects ${name} without upstream calls`, async () => {
-    const f = fixture();
-    const response = await f.worker.fetch(verificationRequest(body), f.env);
-    const result = await response.json();
-    assert.equal(response.status, 400);
-    assert.equal(result.code, 'VALIDATION_FAILED');
-    assert.equal(result.deliveryState, 'not_sent');
-    assert.equal(f.calls.length, 0);
-  });
-}
-
-for (const [name, options, env, status, code] of [
-  ['GET', { method: 'GET' }, {}, 405, 'METHOD_NOT_ALLOWED'],
-  ['OPTIONS', { method: 'OPTIONS' }, {}, 405, 'METHOD_NOT_ALLOWED'],
-  ['foreign Origin', { origin: 'https://attacker.example' }, {}, 403, 'ORIGIN_NOT_ALLOWED'],
-  ['missing Origin', { headers: { Origin: null } }, {}, 403, 'ORIGIN_NOT_ALLOWED'],
-  ['same-site not same-origin', { headers: { 'Sec-Fetch-Site': 'same-site' } }, {}, 403, 'ORIGIN_NOT_ALLOWED'],
-  ['bad content type', { headers: { 'Content-Type': 'text/plain' } }, {}, 415, 'CONTENT_TYPE_UNSUPPORTED'],
-  ['missing platform IP', { headers: { 'CF-Connecting-IP': null } }, {}, 503, 'CLIENT_IP_UNAVAILABLE'],
-  ['disabled config', {}, { CONTACT_FORM_ENABLED: 'false' }, 503, 'CONFIG_NOT_READY'],
-  ['missing rate limiter', {}, { CONTACT_RATE_LIMITER: undefined }, 503, 'RATE_LIMIT_BINDING_UNAVAILABLE'],
-  ['rate limit denial', {}, { CONTACT_RATE_LIMITER: { async limit() { return { success: false }; } } }, 429, 'RATE_LIMITED'],
-]) {
-  test(`verification-only enforces ${name}`, async () => {
-    const f = fixture(env);
-    const response = await f.worker.fetch(verificationRequest(undefined, options), f.env);
-    const result = await response.json();
-    assert.equal(response.status, status);
-    assert.equal(result.code, code);
-    assert.equal(result.deliveryState, 'not_sent');
-    assert.equal(f.calls.length, 0);
-  });
-}
-
-for (const [name, providerResponse, code] of [
-  ['invalid response', null, 'CAPTCHA_RESPONSE_INVALID'],
-  ['invalid success type', { success: 1 }, 'CAPTCHA_RESPONSE_INVALID'],
-  ['failed token', { success: false }, 'CAPTCHA_TOKEN_INVALID'],
-  ['wrong hostname', { success: true, hostname: 'attacker.example', action: 'contact' }, 'CAPTCHA_CONTEXT_MISMATCH'],
-  ['wrong action', { success: true, hostname: HOST, action: 'other' }, 'CAPTCHA_CONTEXT_MISMATCH'],
-  ['provider error', { success: false, 'error-codes': ['internal-error'] }, 'CAPTCHA_PROVIDER_ERROR'],
-  ['invalid secret', { success: false, 'error-codes': ['invalid-input-secret'] }, 'CAPTCHA_CONFIGURATION_ERROR'],
-]) {
-  test(`verification-only ${name} can never reach Resend`, async () => {
-    const f = fixture(); f.setVerify(() => Response.json(providerResponse));
-    const result = await (await f.worker.fetch(verificationRequest(), f.env)).json();
-    assert.equal(result.code, code);
-    assert.equal(result.deliveryState, 'not_sent');
-    assert.deepEqual(f.calls.map(call => call.url), ['https://challenges.cloudflare.com/turnstile/v0/siteverify']);
-  });
-}
-
 for (const [providerCode, providerCategory] of [
   ['missing-input-secret', 'configuration'], ['invalid-input-secret', 'configuration'],
   ['missing-input-response', 'token'], ['invalid-input-response', 'token'], ['timeout-or-duplicate', 'token'],
   ['bad-request', 'request'], ['internal-error', 'internal'], ['unknown', 'unknown'],
 ]) {
   test(`HTTP failure exposes only fixed provider code ${providerCode} and category`, async () => {
-    for (const path of ['/api/contact', '/api/contact-verify']) {
+    for (const path of ['/api/contact']) {
       const f = fixture();
       f.setVerify(() => Response.json({ success: false, 'error-codes': [providerCode], private: 'private upstream details' }, { status: 400 }));
-      const req = path === '/api/contact' ? request() : verificationRequest();
+      const req = request(sample(), { path });
       const response = await f.worker.fetch(req, f.env);
       const result = await response.json();
       assert.equal(response.status, 503);
@@ -673,7 +587,7 @@ for (const [providerCode, providerCategory] of [
 test('configuration code takes priority over other allowlisted provider categories', async () => {
   const f = fixture();
   f.setVerify(() => Response.json({ 'error-codes': ['internal-error', 'bad-request', 'invalid-input-response', 'invalid-input-secret'] }, { status: 400 }));
-  const result = await (await f.worker.fetch(verificationRequest(), f.env)).json();
+  const result = await (await f.worker.fetch(request(), f.env)).json();
   assert.equal(result.providerCode, 'invalid-input-secret');
   assert.equal(result.providerCategory, 'configuration');
   assert.equal(result.code, 'CAPTCHA_HTTP_ERROR');
@@ -693,7 +607,7 @@ for (const [name, responseFactory] of [
 ]) {
   test(`non-2xx ${name} stays HTTP_ERROR/unknown with no Resend`, async () => {
     const f = fixture(); f.setVerify(responseFactory);
-    const result = await (await f.worker.fetch(verificationRequest(), f.env)).json();
+    const result = await (await f.worker.fetch(request(), f.env)).json();
     assert.equal(result.code, 'CAPTCHA_HTTP_ERROR');
     assert.equal(result.upstreamStatus, 400);
     assert.equal(result.providerCode, 'unknown');
@@ -714,7 +628,7 @@ test('non-2xx body uses existing CAPTCHA deadline, cancels a stalled read, and s
     setTimeout(() => controller.abort(new DOMException('private timeout detail', 'TimeoutError')), 5);
     return new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status: 400 });
   });
-  const result = await (await f.worker.fetch(verificationRequest(), f.env)).json();
+  const result = await (await f.worker.fetch(request(), f.env)).json();
   assert.deepEqual(durations, [8000]);
   assert.equal(result.code, 'CAPTCHA_HTTP_ERROR');
   assert.equal(result.upstreamStatus, 400);
@@ -724,4 +638,59 @@ test('non-2xx body uses existing CAPTCHA deadline, cancels a stalled read, and s
   assert.equal(cancelled, true);
   assert.equal(f.calls.length, 1);
   assert.ok(!JSON.stringify(result).includes('private'));
+});
+
+test('retired verification-only route is unavailable on every authorized hostname and never calls a provider', async () => {
+  for (const origin of [ORIGIN, 'https://lavishtreeservice.com']) {
+    for (const method of ['GET', 'POST', 'OPTIONS']) {
+      const f = fixture({ CONTACT_ALLOWED_ORIGINS: 'https://lavishtreeservice.com,https://www.lavishtreeservice.com' });
+      const response = await f.worker.fetch(request({ turnstileToken: 'local-mock-token' }, {
+        path: '/api/contact-verify', method, urlOrigin: origin, origin,
+      }), f.env);
+      const result = await response.json();
+      assert.equal(response.status, 404);
+      assert.equal(result.code, 'NOT_FOUND');
+      assert.equal(result.deliveryState, 'not_sent');
+      assert.equal(f.calls.length, 0);
+      assert.equal(f.rateCalls.length, 0);
+    }
+  }
+});
+
+
+test('exact www host redirects before assets or APIs with a permanent path/query-preserving HTTPS redirect', async () => {
+  for (const scheme of ['http', 'https']) {
+    for (const path of ['/', '/assets/lavish-logo.webp?v=2', '/work/tree%20removal?next=https%3A%2F%2Fexample.com&x=1', '/api/contact?source=www']) {
+      for (const method of ['GET', 'HEAD', 'POST']) {
+        const f = fixture({ ASSETS: { fetch() { throw new Error('Assets must not run before canonical redirect'); } } });
+        const origin = `${scheme}://www.lavishtreeservice.com`;
+        const response = await f.worker.fetch(request(sample(), { urlOrigin: origin, origin, path, method }), f.env);
+        assert.equal(response.status, 308);
+        assert.equal(response.headers.get('location'), `https://lavishtreeservice.com${path}`);
+        assert.equal(f.calls.length, 0);
+        assert.equal(f.rateCalls.length, 0);
+      }
+    }
+  }
+});
+
+test('canonical redirect never applies to preview, apex, or unrelated/suffix-lookalike hosts', async () => {
+  for (const origin of [ORIGIN, 'https://lavishtreeservice.com', 'https://other.workers.dev', 'https://not-www.lavishtreeservice.com', 'https://www.lavishtreeservice.com.evil.example']) {
+    const f = fixture();
+    const response = await f.worker.fetch(request(null, { urlOrigin: origin, origin, path: '/assets/example.webp?v=1', method: 'GET' }), f.env);
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), 'STATIC ASSET');
+    assert.equal(response.headers.get('location'), null);
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+test('untrusted Host and forwarded-host headers cannot trigger the canonical redirect', async () => {
+  const f = fixture();
+  const response = await f.worker.fetch(request(null, { path: '/', method: 'GET', headers: {
+    Host: 'www.lavishtreeservice.com', 'X-Forwarded-Host': 'www.lavishtreeservice.com',
+  } }), f.env);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('location'), null);
+  assert.equal(f.calls.length, 0);
 });

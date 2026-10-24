@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 const read = path => readFileSync(new URL('../'+path,import.meta.url),'utf8');
 const html=read('dist/index.html'), headers=read('dist/_headers');
 const config=JSON.parse(read('wrangler.jsonc'));
@@ -17,7 +17,7 @@ test('Turnstile CSP grants only required script/frame and same-origin API access
 });
 test('worker and asset routing preserve the preview identity and do not alter domain routes',()=>{
   assert.equal(config.name,'lavish-tree-service'); assert.equal(config.main,'src/contact-worker.mjs');
-  assert.equal(config.assets.binding,'ASSETS'); assert.deepEqual(config.assets.run_worker_first,['/api/*']);
+  assert.equal(config.assets.binding,'ASSETS'); assert.equal(config.assets.run_worker_first,true);
   assert.equal(config.routes,undefined);assert.equal(config.route,undefined);
   assert.equal(config.vars.CONTACT_FROM,'webforms@notify.lavishtreeservice.com');
   assert.equal(config.vars.CONTACT_ALLOWED_ORIGINS,'https://lavishtreeservice.com,https://www.lavishtreeservice.com');
@@ -30,4 +30,10 @@ test('enabled deployment must include public site key and rate limiter prerequis
     const rate=config.ratelimits.find(r=>r.name==='CONTACT_RATE_LIMITER');
     assert.match(rate.namespace_id,/^[1-9][0-9]*$/); assert.deepEqual(rate.simple,{limit:5,period:60});
   }
+});
+
+test('temporary verification diagnostic assets and client are removed after delivery verification',()=>{
+ for(const path of ['dist/verification-check.html','dist/verification-check.js','dist/verification-check.css','src/verification-client.mjs']) assert.equal(existsSync(new URL('../'+path,import.meta.url)),false,path);
+ assert.match(html,/name="robots" content="noindex,nofollow"/);
+ assert.match(read('dist/robots.txt'),/Disallow: \/$/m);
 });

@@ -3,6 +3,15 @@
 using Workerd = import "/workerd/workerd.capnp";
 const config :Workerd.Config = (
   services = [
+    (name = "launch-runtime", worker = (
+      compatibilityDate = "2026-10-22",
+      modules = [
+        (name = "launch.mjs", esModule = embed "launch.mjs"),
+        (name = "contact-worker.mjs", esModule = embed "../../src/contact-worker.mjs"),
+        (name = "home.html", text = embed "../../dist/index.html")
+      ],
+      globalOutbound = "upstream-mock"
+    )),
     (name = "contact-runtime", worker = (
       compatibilityDate = "2026-10-22",
       modules = [
