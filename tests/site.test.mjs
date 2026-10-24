@@ -77,3 +77,10 @@ test('meaningful telephone numbers and gallery position counts remain intact', (
   assert.ok(html.includes('id="gallery-count" aria-live="polite">1 / 3'));
   assert.ok(js.includes('${photoIndex + 1} / ${photos.length}'));
 });
+
+test('hero features the original large logo and exact neighborhood slogan', () => {
+  assert.match(html, /class="hero-brand"><img src="assets\/lavish-logo.webp"/);
+  assert.ok(html.includes('<p>We’re already in your neighborhood</p>'));
+  assert.ok(css.includes('.hero-brand>img{width:200px;height:200px'));
+  assert.ok(css.includes('.hero-brand>img{width:150px;height:150px'));
+});
