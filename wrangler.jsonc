@@ -2,6 +2,27 @@
   "name": "lavish-tree-service",
   "compatibility_date": "2026-10-22",
   "assets": {
-    "directory": "./dist"
-  }
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": [
+      "/api/*"
+    ]
+  },
+  "main": "src/contact-worker.mjs",
+  "vars": {
+    "CONTACT_FORM_ENABLED": "false",
+    "CONTACT_FROM": "webforms@notify.lavishtreeservice.com",
+    "CONTACT_ALLOWED_ORIGINS": "https://lavishtreeservice.com,https://www.lavishtreeservice.com",
+    "TURNSTILE_SITE_KEY": "0x4AAAAAAAFkHs_2LwMRbnnLJ"
+  },
+  "ratelimits": [
+    {
+      "name": "CONTACT_RATE_LIMITER",
+      "namespace_id": "1601609128",
+      "simple": {
+        "limit": 5,
+        "period": 60
+      }
+    }
+  ]
 }

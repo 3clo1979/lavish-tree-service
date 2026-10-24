@@ -42,3 +42,6 @@
 .form-grid label{font-size:13px}
 .form-grid input,.form-grid textarea,.form-grid select{font-size:16px}
 @media(max-width:700px){.quote-heading{display:block;padding:22px 16px}.quote-heading h3{font-size:30px;max-width:290px}.quote-heading>span{display:block;margin-top:12px}.quote-description p{font-size:12px}.form-grid label{font-size:12px}.form-grid{grid-template-columns:1fr}.form-grid .full{grid-column:auto}.quote-panel form{margin-top:22px}}
+
+/* Progressive contact delivery, activated only by verified server configuration. */
+.form-honeypot{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}.contact-security{margin-top:20px;min-width:0;max-width:100%}.contact-security:empty{display:none}.delivery-result{overflow-wrap:anywhere}
