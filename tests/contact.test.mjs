@@ -38,6 +38,9 @@ function fixture(overrides = {}) {
   let verify = () => Response.json({ success: true, hostname: HOST, action: 'contact' });
   let send = () => Response.json({ id: MAIL_ID });
   const worker = createContactWorker({ fetchImpl: async (url, init) => {
+    // Match workerd's supported modes instead of accepting Node-only options.
+    // Production Workers throws before network I/O for redirect: 'error'.
+    if (!['manual', 'follow'].includes(init.redirect)) throw new TypeError('Unsupported redirect mode');
     calls.push({ url, init });
     if (url === 'https://challenges.cloudflare.com/turnstile/v0/siteverify') return verify(url, init);
     if (url === 'https://api.resend.com/emails') return send(url, init);
@@ -284,7 +287,7 @@ test('accepted request uses only fixed recipient/from, validated reply_to, text 
   assert.match(mail.init.headers['Idempotency-Key'], /^lavish-contact\/[a-f0-9]{64}$/);
   assert.ok(!mail.init.body.includes(body.turnstileToken));
   assert.ok(!mail.init.body.includes('192.0.2.1'));
-  for (const call of f.calls) { assert.equal(call.init.redirect, 'error'); assert.ok(call.init.signal instanceof AbortSignal); }
+  for (const call of f.calls) { assert.equal(call.init.redirect, 'manual'); assert.ok(call.init.signal instanceof AbortSignal); }
 });
 
 test('optional email and honeypot can be omitted; no reply_to is invented', async () => {
@@ -432,4 +435,43 @@ test('empty-object diagnostic exposes a broken rate binding without any upstream
   const f=fixture({CONTACT_RATE_LIMITER:{async limit(){throw new Error('mock binding error');}}});
   const response=await f.worker.fetch(request({}),f.env);const body=await response.json();
   assert.equal(response.status,503);assert.equal(body.code,'RATE_LIMIT_BINDING_UNAVAILABLE');assert.equal(body.deliveryState,'not_sent');assert.equal(f.calls.length,0);
+});
+
+test('both upstream calls use a workerd-supported non-following redirect mode', async () => {
+  const f = fixture();
+  const response = await f.worker.fetch(request(), f.env);
+  assert.equal(response.status, 202);
+  assert.deepEqual(await response.json(), { ok: true, requestId: MAIL_ID });
+  assert.equal(f.calls.length, 2);
+  assert.deepEqual(f.calls.map(call => call.init.redirect), ['manual', 'manual']);
+});
+
+test('every 3xx Siteverify response fails closed without a redirect follow or Resend call', async () => {
+  for (let status = 300; status < 400; status++) {
+    const f = fixture();
+    f.setVerify(() => new Response(null, { status, headers: { Location: 'https://untrusted.example/collect' } }));
+    const response = await f.worker.fetch(request(), f.env);
+    const result = await response.json();
+    assert.equal(response.status, 503, `Siteverify ${status}`);
+    assert.equal(result.code, 'CAPTCHA_UPSTREAM_UNAVAILABLE');
+    assert.equal(result.deliveryState, 'not_sent');
+    assert.deepEqual(f.calls.map(call => call.url), ['https://challenges.cloudflare.com/turnstile/v0/siteverify']);
+    assert.equal(f.calls[0].init.redirect, 'manual');
+  }
+});
+
+test('every 3xx Resend response is rejected without following or leaking credentials to a new endpoint', async () => {
+  for (let status = 300; status < 400; status++) {
+    const f = fixture();
+    f.setSend(() => new Response(null, { status, headers: { Location: 'https://untrusted.example/collect' } }));
+    const response = await f.worker.fetch(request(), f.env);
+    const result = await response.json();
+    assert.equal(response.status, 502, `Resend ${status}`);
+    assert.equal(result.code, 'RESEND_REJECTED');
+    assert.equal(result.deliveryState, 'rejected');
+    assert.deepEqual(f.calls.map(call => call.url), [
+      'https://challenges.cloudflare.com/turnstile/v0/siteverify', 'https://api.resend.com/emails',
+    ]);
+    assert.deepEqual(f.calls.map(call => call.init.redirect), ['manual', 'manual']);
+  }
 });

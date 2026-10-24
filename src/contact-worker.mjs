@@ -219,7 +219,9 @@ export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ secret: env.TURNSTILE_SECRET_KEY, response: data.turnstileToken, remoteip: ip }),
-            redirect: 'error',
+            // Workers supports manual/follow, not error. Never follow a redirect
+            // carrying a token/secret; the non-2xx check below rejects all 3xx.
+            redirect: 'manual',
             signal: AbortSignal.timeout(8000),
           });
           if (!response.ok) return failure(503, 'Verification is unavailable. Please try again or contact Lavish directly.', 'CAPTCHA_UPSTREAM_UNAVAILABLE');
@@ -254,7 +256,8 @@ export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
               'Idempotency-Key': idempotencyKey,
             },
             body: payload,
-            redirect: 'error',
+            // Keep credentials and customer details on this exact endpoint.
+            redirect: 'manual',
             signal: AbortSignal.timeout(10000),
           };
           sendAttempted = true;
