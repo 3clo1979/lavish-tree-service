@@ -52,7 +52,7 @@ function fixture(overrides = {}) {
 test('disabled by default and never calls an upstream provider', async () => {
   const f = fixture({ CONTACT_FORM_ENABLED: undefined });
   const config = await f.worker.fetch(request(null, { method: 'GET', path: '/api/contact-config' }), f.env);
-  assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT });
+  assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT, diagnosticsVersion: 2 });
   assert.equal((await f.worker.fetch(request(), f.env)).status, 503);
   assert.equal(f.calls.length, 0);
   assert.equal(f.rateCalls.length, 0);
@@ -61,7 +61,7 @@ test('disabled by default and never calls an upstream provider', async () => {
 test('enabled configuration exposes only public settings, never secrets or sender', async () => {
   const f = fixture();
   const response = await f.worker.fetch(request(null, { method: 'GET', path: '/api/contact-config' }), f.env);
-  assert.deepEqual(await response.json(), { enabled: true, recipient: RECIPIENT, siteKey: 'mock-public-site-key' });
+  assert.deepEqual(await response.json(), { enabled: true, recipient: RECIPIENT, diagnosticsVersion: 2, siteKey: 'mock-public-site-key' });
   assert.equal(response.headers.get('cache-control'), 'no-store');
   assert.equal(response.headers.get('x-content-type-options'), 'nosniff');
   assert.equal(response.headers.get('access-control-allow-origin'), null);
@@ -86,7 +86,7 @@ for (const [name, patch] of [
     const f = fixture(patch);
     assert.equal((await f.worker.fetch(request(), f.env)).status, 503);
     const config = await f.worker.fetch(request(null, { method: 'GET', path: '/api/contact-config' }), f.env);
-    assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT });
+    assert.deepEqual(await config.json(), { enabled: false, recipient: RECIPIENT, diagnosticsVersion: 2 });
     assert.equal(f.calls.length, 0);
   });
 }
@@ -246,7 +246,7 @@ for (const verification of [
   test(`rejects invalid Turnstile validation ${JSON.stringify(verification)}`, async () => {
     const f = fixture();
     f.setVerify(() => Response.json(verification));
-    assert.equal((await f.worker.fetch(request(), f.env)).status, 403);
+    assert.equal((await f.worker.fetch(request(), f.env)).status, verification === null ? 503 : 403);
     assert.equal(f.calls.length, 1);
   });
 }
@@ -370,14 +370,14 @@ for (const [name, options] of [
   ['failed rate binding', { env: { CONTACT_RATE_LIMITER: { async limit() { throw new Error('private binding failure'); } } }, status: 503, code: 'RATE_LIMIT_BINDING_UNAVAILABLE' }],
   ['malformed rate result', { env: { CONTACT_RATE_LIMITER: { async limit() { return {}; } } }, status: 503, code: 'RATE_LIMIT_BINDING_UNAVAILABLE' }],
   ['rate limited', { env: { CONTACT_RATE_LIMITER: { async limit() { return { success: false }; } } }, status: 429, code: 'RATE_LIMITED' }],
-  ['CAPTCHA HTTP failure', { verify: () => new Response('private provider failure', { status: 500 }), status: 503, code: 'CAPTCHA_UPSTREAM_UNAVAILABLE' }],
-  ['CAPTCHA connection failure', { verify: () => { throw new Error('private upstream error'); }, status: 503, code: 'CAPTCHA_UPSTREAM_UNAVAILABLE' }],
-  ['CAPTCHA bad JSON', { verify: () => new Response('{bad'), status: 503, code: 'CAPTCHA_UPSTREAM_UNAVAILABLE' }],
-  ['CAPTCHA internal error category', { verify: () => Response.json({ success: false, 'error-codes': ['internal-error'] }), status: 503, code: 'CAPTCHA_UPSTREAM_UNAVAILABLE' }],
+  ['CAPTCHA HTTP failure', { verify: () => new Response('private provider failure', { status: 500 }), status: 503, code: 'CAPTCHA_HTTP_ERROR', upstreamStatus: 500 }],
+  ['CAPTCHA connection failure', { verify: () => { throw new Error('private upstream error'); }, status: 503, code: 'CAPTCHA_FETCH_ERROR', exceptionType: 'Error' }],
+  ['CAPTCHA bad JSON', { verify: () => new Response('{bad'), status: 503, code: 'CAPTCHA_RESPONSE_INVALID', exceptionType: 'Error' }],
+  ['CAPTCHA internal error category', { verify: () => Response.json({ success: false, 'error-codes': ['internal-error'] }), status: 503, code: 'CAPTCHA_PROVIDER_ERROR' }],
   ['CAPTCHA invalid secret category', { verify: () => Response.json({ success: false, 'error-codes': ['invalid-input-secret'] }), status: 503, code: 'CAPTCHA_CONFIGURATION_ERROR' }],
   ['CAPTCHA missing secret category', { verify: () => Response.json({ success: false, 'error-codes': ['missing-input-secret'] }), status: 503, code: 'CAPTCHA_CONFIGURATION_ERROR' }],
   ['CAPTCHA rejected token', { verify: () => Response.json({ success: false, 'error-codes': ['timeout-or-duplicate'] }), status: 403, code: 'CAPTCHA_TOKEN_INVALID' }],
-  ['CAPTCHA malformed error categories', { verify: () => Response.json({ success: false, 'error-codes': 'private provider data' }), status: 403, code: 'CAPTCHA_TOKEN_INVALID' }],
+  ['CAPTCHA malformed error categories', { verify: () => Response.json({ success: false, 'error-codes': 'private provider data' }), status: 503, code: 'CAPTCHA_RESPONSE_INVALID' }],
   ['CAPTCHA hostname mismatch', { verify: () => Response.json({ success: true, hostname: 'other.example', action: 'contact' }), status: 403, code: 'CAPTCHA_CONTEXT_MISMATCH' }],
   ['CAPTCHA action mismatch', { verify: () => Response.json({ success: true, hostname: HOST, action: 'other' }), status: 403, code: 'CAPTCHA_CONTEXT_MISMATCH' }],
 ]) {
@@ -387,7 +387,9 @@ for (const [name, options] of [
     const response = await f.worker.fetch(request({ ...sample(), ...options.body }, options.request), f.env);
     assert.equal(response.status, options.status);
     const result = await response.json();
-    assert.deepEqual(Object.keys(result).sort(), ['code', 'deliveryState', 'error', 'ok']);
+    assert.deepEqual(Object.keys(result).sort(), ['code', 'deliveryState', 'error', 'ok', ...(options.upstreamStatus ? ['upstreamStatus'] : []), ...(options.exceptionType ? ['exceptionType'] : [])].sort());
+    assert.equal(result.upstreamStatus, options.upstreamStatus);
+    assert.equal(result.exceptionType, options.exceptionType);
     assert.equal(result.ok, false);
     assert.equal(result.code, options.code);
     assert.equal(result.deliveryState, 'not_sent');
@@ -453,7 +455,8 @@ test('every 3xx Siteverify response fails closed without a redirect follow or Re
     const response = await f.worker.fetch(request(), f.env);
     const result = await response.json();
     assert.equal(response.status, 503, `Siteverify ${status}`);
-    assert.equal(result.code, 'CAPTCHA_UPSTREAM_UNAVAILABLE');
+    assert.equal(result.code, 'CAPTCHA_HTTP_ERROR');
+    assert.equal(result.upstreamStatus, status);
     assert.equal(result.deliveryState, 'not_sent');
     assert.deepEqual(f.calls.map(call => call.url), ['https://challenges.cloudflare.com/turnstile/v0/siteverify']);
     assert.equal(f.calls[0].init.redirect, 'manual');
@@ -475,3 +478,168 @@ test('every 3xx Resend response is rejected without following or leaking credent
     assert.deepEqual(f.calls.map(call => call.init.redirect), ['manual', 'manual']);
   }
 });
+
+test('local CAPTCHA request setup failure has its own safe category without upstream I/O', async t => {
+  const f = fixture();
+  t.mock.method(AbortSignal, 'timeout', () => { throw new TypeError('private runtime construction detail'); });
+  const response = await f.worker.fetch(request(), f.env);
+  const result = await response.json();
+  assert.equal(result.code, 'CAPTCHA_REQUEST_ERROR');
+  assert.equal(result.exceptionType, 'TypeError');
+  assert.equal(result.deliveryState, 'not_sent');
+  assert.equal(f.calls.length, 0);
+  assert.ok(!JSON.stringify(result).includes('private'));
+});
+
+for (const name of ['TypeError', 'RangeError', 'Error', 'AbortError', 'TimeoutError', 'private exception name']) {
+  test(`CAPTCHA fetch exception exposes only an allowlisted class: ${name}`, async () => {
+    const f = fixture();
+    f.setVerify(() => { throw Object.assign(new Error('private provider message'), { name }); });
+    const result = await (await f.worker.fetch(request(), f.env)).json();
+    assert.equal(result.code, ['AbortError', 'TimeoutError'].includes(name) ? 'CAPTCHA_TIMEOUT' : 'CAPTCHA_FETCH_ERROR');
+    assert.equal(result.exceptionType, name.startsWith('private') ? 'OtherError' : name);
+    assert.equal(result.deliveryState, 'not_sent');
+    assert.equal(result.upstreamStatus, undefined);
+    assert.equal(f.calls.length, 1);
+    assert.ok(!JSON.stringify(result).includes('private'));
+  });
+}
+
+test('CAPTCHA body stream timeout is distinguished from malformed JSON', async () => {
+  const f = fixture();
+  f.setVerify(() => new Response(new ReadableStream({
+    start(controller) { controller.error(new DOMException('private timeout detail', 'TimeoutError')); },
+  })));
+  const result = await (await f.worker.fetch(request(), f.env)).json();
+  assert.equal(result.code, 'CAPTCHA_TIMEOUT');
+  assert.equal(result.exceptionType, 'TimeoutError');
+  assert.equal(result.deliveryState, 'not_sent');
+  assert.equal(f.calls.length, 1);
+});
+
+for (const [name, responseFactory] of [
+  ['empty response', () => new Response(null)],
+  ['invalid UTF-8', () => new Response(new Uint8Array([0xff, 0xfe]))],
+  ['HTML error page with 200 status', () => new Response('<html>private origin data</html>')],
+  ['JSON array', () => Response.json([])],
+  ['JSON null', () => Response.json(null)],
+  ['missing success flag', () => Response.json({})],
+  ['truthy nonboolean success flag', () => Response.json({ success: 'true', hostname: HOST, action: 'contact' })],
+  ['nonstring error category', () => Response.json({ success: false, 'error-codes': [123] })],
+  ['invalid length header', () => new Response('{}', { headers: { 'Content-Length': 'private length' } })],
+  ['no response object', () => null],
+  ['noninteger HTTP status', () => ({ ok: false, status: 'private status' })],
+  ['out-of-range HTTP status', () => ({ ok: false, status: 999 })],
+  ['inconsistent response status', () => ({ ok: true, status: 500 })],
+]) {
+  test(`CAPTCHA malformed response diagnostic: ${name}`, async () => {
+    const f = fixture(); f.setVerify(responseFactory);
+    const response = await f.worker.fetch(request(), f.env);
+    const result = await response.json();
+    assert.equal(response.status, 503);
+    assert.equal(result.code, 'CAPTCHA_RESPONSE_INVALID');
+    assert.equal(result.deliveryState, 'not_sent');
+    assert.equal(result.upstreamStatus, undefined);
+    assert.equal(f.calls.length, 1);
+    assert.ok(!JSON.stringify(result).includes('private'));
+  });
+}
+
+test('valid streamed Siteverify JSON works with split UTF-8 chunks and real HTTP-style headers', async () => {
+  const f = fixture();
+  f.setVerify(() => {
+    const bytes = new TextEncoder().encode(JSON.stringify({ success: true, hostname: HOST, action: 'contact', extra: '🌳 café' }));
+    return new Response(new ReadableStream({ start(controller) {
+      for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+      controller.close();
+    } }), { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': String(bytes.length) } });
+  });
+  assert.equal((await f.worker.fetch(request(), f.env)).status, 202);
+  assert.equal(f.calls.length, 2);
+});
+
+const verificationRequest = (body = { turnstileToken: 'local-mock-token' }, options = {}) => request(body, { path: '/api/contact-verify', ...options });
+
+test('verification-only success structurally exits before email construction and Resend', async () => {
+  const f = fixture();
+  f.setSend(() => { throw new Error('Resend must never be reached'); });
+  const response = await f.worker.fetch(verificationRequest(), f.env);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, verified: true, deliveryState: 'not_sent' });
+  assert.deepEqual(f.calls.map(call => call.url), ['https://challenges.cloudflare.com/turnstile/v0/siteverify']);
+  assert.equal(f.rateCalls.length, 1);
+  assert.deepEqual(Object.keys(JSON.parse(f.calls[0].init.body)).sort(), ['remoteip', 'response', 'secret']);
+});
+
+for (const origin of ['https://lavishtreeservice.com', 'https://www.lavishtreeservice.com', 'https://other.workers.dev', ORIGIN.replace('https:', 'http:')]) {
+  test(`verification-only endpoint is denied on ${origin} even when normal custom origins are enabled`, async () => {
+    const f = fixture({ CONTACT_ALLOWED_ORIGINS: 'https://lavishtreeservice.com,https://www.lavishtreeservice.com' });
+    const response = await f.worker.fetch(verificationRequest(undefined, { urlOrigin: origin, origin }), f.env);
+    const result = await response.json();
+    assert.equal(response.status, 403);
+    assert.equal(result.code, 'ORIGIN_NOT_ALLOWED');
+    assert.equal(result.deliveryState, 'not_sent');
+    assert.equal(f.calls.length, 0);
+  });
+}
+
+for (const [name, body] of [
+  ['missing token', {}], ['null', null], ['array', []], ['empty token', { turnstileToken: '' }],
+  ['whitespace token', { turnstileToken: ' ' }], ['numeric token', { turnstileToken: 123 }],
+  ['oversized token', { turnstileToken: 'x'.repeat(2049) }],
+  ['contact fields', { ...sample() }],
+  ['email recipient', { turnstileToken: 'local-mock-token', to: RECIPIENT }],
+  ['customer data', { turnstileToken: 'local-mock-token', email: 'customer@example.com' }],
+  ['send switch', { turnstileToken: 'local-mock-token', send: true }],
+]) {
+  test(`verification-only rejects ${name} without upstream calls`, async () => {
+    const f = fixture();
+    const response = await f.worker.fetch(verificationRequest(body), f.env);
+    const result = await response.json();
+    assert.equal(response.status, 400);
+    assert.equal(result.code, 'VALIDATION_FAILED');
+    assert.equal(result.deliveryState, 'not_sent');
+    assert.equal(f.calls.length, 0);
+  });
+}
+
+for (const [name, options, env, status, code] of [
+  ['GET', { method: 'GET' }, {}, 405, 'METHOD_NOT_ALLOWED'],
+  ['OPTIONS', { method: 'OPTIONS' }, {}, 405, 'METHOD_NOT_ALLOWED'],
+  ['foreign Origin', { origin: 'https://attacker.example' }, {}, 403, 'ORIGIN_NOT_ALLOWED'],
+  ['missing Origin', { headers: { Origin: null } }, {}, 403, 'ORIGIN_NOT_ALLOWED'],
+  ['same-site not same-origin', { headers: { 'Sec-Fetch-Site': 'same-site' } }, {}, 403, 'ORIGIN_NOT_ALLOWED'],
+  ['bad content type', { headers: { 'Content-Type': 'text/plain' } }, {}, 415, 'CONTENT_TYPE_UNSUPPORTED'],
+  ['missing platform IP', { headers: { 'CF-Connecting-IP': null } }, {}, 503, 'CLIENT_IP_UNAVAILABLE'],
+  ['disabled config', {}, { CONTACT_FORM_ENABLED: 'false' }, 503, 'CONFIG_NOT_READY'],
+  ['missing rate limiter', {}, { CONTACT_RATE_LIMITER: undefined }, 503, 'RATE_LIMIT_BINDING_UNAVAILABLE'],
+  ['rate limit denial', {}, { CONTACT_RATE_LIMITER: { async limit() { return { success: false }; } } }, 429, 'RATE_LIMITED'],
+]) {
+  test(`verification-only enforces ${name}`, async () => {
+    const f = fixture(env);
+    const response = await f.worker.fetch(verificationRequest(undefined, options), f.env);
+    const result = await response.json();
+    assert.equal(response.status, status);
+    assert.equal(result.code, code);
+    assert.equal(result.deliveryState, 'not_sent');
+    assert.equal(f.calls.length, 0);
+  });
+}
+
+for (const [name, providerResponse, code] of [
+  ['invalid response', null, 'CAPTCHA_RESPONSE_INVALID'],
+  ['invalid success type', { success: 1 }, 'CAPTCHA_RESPONSE_INVALID'],
+  ['failed token', { success: false }, 'CAPTCHA_TOKEN_INVALID'],
+  ['wrong hostname', { success: true, hostname: 'attacker.example', action: 'contact' }, 'CAPTCHA_CONTEXT_MISMATCH'],
+  ['wrong action', { success: true, hostname: HOST, action: 'other' }, 'CAPTCHA_CONTEXT_MISMATCH'],
+  ['provider error', { success: false, 'error-codes': ['internal-error'] }, 'CAPTCHA_PROVIDER_ERROR'],
+  ['invalid secret', { success: false, 'error-codes': ['invalid-input-secret'] }, 'CAPTCHA_CONFIGURATION_ERROR'],
+]) {
+  test(`verification-only ${name} can never reach Resend`, async () => {
+    const f = fixture(); f.setVerify(() => Response.json(providerResponse));
+    const result = await (await f.worker.fetch(verificationRequest(), f.env)).json();
+    assert.equal(result.code, code);
+    assert.equal(result.deliveryState, 'not_sent');
+    assert.deepEqual(f.calls.map(call => call.url), ['https://challenges.cloudflare.com/turnstile/v0/siteverify']);
+  });
+}

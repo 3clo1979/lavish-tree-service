@@ -114,3 +114,8 @@ test('success notice survives later CAPTCHA expiration and refresh without anoth
   const notice=h.status().textContent;h.window.widget['expired-callback']();h.window.widget.callback('new-token');
   assert.equal(h.status().textContent,notice);assert.equal(h.status().hidden,false);assert.equal(h.requests.length,1);
 });
+test('granular verification diagnostics show only safe status or exception category',()=>{
+  assert.match(describeDeliveryFailure({code:'CAPTCHA_HTTP_ERROR',deliveryState:'not_sent',upstreamStatus:400}),/CAPTCHA_HTTP_ERROR \(HTTP 400\)/);
+  assert.match(describeDeliveryFailure({code:'CAPTCHA_FETCH_ERROR',deliveryState:'not_sent',exceptionType:'TypeError'}),/CAPTCHA_FETCH_ERROR \(TypeError\)/);
+  for(const value of [{code:'CAPTCHA_HTTP_ERROR',deliveryState:'not_sent',upstreamStatus:'sensitive'},{code:'CAPTCHA_FETCH_ERROR',deliveryState:'not_sent',exceptionType:'sensitive'}])assert.ok(!describeDeliveryFailure(value).includes('sensitive'));
+});

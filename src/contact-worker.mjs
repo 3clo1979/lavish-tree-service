@@ -13,6 +13,9 @@ const MAX_BODY_BYTES = 16_384;
 const MAX_UPSTREAM_BYTES = 16_384;
 const UNAVAILABLE = 'Online requests are unavailable right now. Please call Lavish or email sales@lavishtreeservice.com.';
 const NOT_CONFIRMED = 'We could not confirm your request was accepted. Your details have been kept here. Please retry with the same details or contact Lavish directly.';
+const VERIFICATION_UNAVAILABLE = 'Verification is unavailable. Please try again or contact Lavish directly.';
+const EXCEPTION_TYPES = new Set(['TypeError', 'RangeError', 'Error', 'AbortError', 'TimeoutError', 'OtherError']);
+const EXCEPTION_CODES = new Set(['CAPTCHA_REQUEST_ERROR', 'CAPTCHA_FETCH_ERROR', 'CAPTCHA_TIMEOUT', 'CAPTCHA_RESPONSE_INVALID']);
 
 class RequestError extends Error {
   constructor(status, message, code = 'VALIDATION_FAILED') {
@@ -39,9 +42,12 @@ function json(value, status = 200, extraHeaders = {}) {
 // upstream error text, or raw exceptions in a response or diagnostic log.
 // `not_sent` is only safe before invoking Resend. An attempted send with no
 // conclusive response is `unknown`; only an observed non-2xx is `rejected`.
-function failure(status, error, code, deliveryState = 'not_sent', headers) {
-  return json({ ok: false, error, code, deliveryState }, status, headers);
+function failure(status, error, code, deliveryState = 'not_sent', headers, upstreamStatus, exceptionType) {
+  const safeStatus = code === 'CAPTCHA_HTTP_ERROR' && Number.isInteger(upstreamStatus) && upstreamStatus >= 100 && upstreamStatus <= 599;
+  const safeException = EXCEPTION_CODES.has(code) && EXCEPTION_TYPES.has(exceptionType);
+  return json({ ok: false, error, code, deliveryState, ...(safeStatus ? { upstreamStatus } : {}), ...(safeException ? { exceptionType } : {}) }, status, headers);
 }
+function exceptionCategory(error) { return EXCEPTION_TYPES.has(error?.name) ? error.name : 'OtherError'; }
 function nonemptySetting(value, max = 256) {
   return typeof value === 'string' && value.length > 0 && value.length <= max && !/[\s\x00-\x1f\x7f]/.test(value);
 }
@@ -139,6 +145,67 @@ function validate(body) {
   return data;
 }
 
+function validateVerificationOnly(body) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+    || Object.keys(body).length !== 1 || !Object.hasOwn(body, 'turnstileToken')
+    || typeof body.turnstileToken !== 'string' || body.turnstileToken.length === 0
+    || body.turnstileToken.length > 2048 || /[\s\x00-\x1f\x7f]/.test(body.turnstileToken)) {
+    throw new RequestError(400, 'Please complete the verification before checking.');
+  }
+  return { turnstileToken: body.turnstileToken };
+}
+
+function verificationTimeout(error, signal) {
+  return signal?.aborted === true || error?.name === 'AbortError' || error?.name === 'TimeoutError';
+}
+
+// One shared Siteverify implementation for contact and the no-email diagnostic.
+// Only fixed categories and an HTTP status may escape this boundary.
+async function verifyTurnstile(data, ip, hostname, env, fetchImpl) {
+  let options;
+  try {
+    options = {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ secret: env.TURNSTILE_SECRET_KEY, response: data.turnstileToken, remoteip: ip }),
+      // Workers does not support redirect:'error'. Manual never forwards secrets.
+      redirect: 'manual', signal: AbortSignal.timeout(8000),
+    };
+  } catch (error) { return failure(503, VERIFICATION_UNAVAILABLE, 'CAPTCHA_REQUEST_ERROR', 'not_sent', undefined, undefined, exceptionCategory(error)); }
+
+  let response;
+  try { response = await fetchImpl('https://challenges.cloudflare.com/turnstile/v0/siteverify', options); }
+  catch (error) {
+    return failure(503, VERIFICATION_UNAVAILABLE, verificationTimeout(error, options.signal) ? 'CAPTCHA_TIMEOUT' : 'CAPTCHA_FETCH_ERROR', 'not_sent', undefined, undefined, exceptionCategory(error));
+  }
+  if (!response || typeof response.ok !== 'boolean' || !Number.isInteger(response.status) || response.status < 100 || response.status > 599
+    || response.ok !== (response.status >= 200 && response.status < 300)) {
+    return failure(503, VERIFICATION_UNAVAILABLE, 'CAPTCHA_RESPONSE_INVALID');
+  }
+  if (!response.ok) return failure(503, VERIFICATION_UNAVAILABLE, 'CAPTCHA_HTTP_ERROR', 'not_sent', undefined, response.status);
+
+  let verification;
+  try { verification = await boundedJson(response, MAX_UPSTREAM_BYTES); }
+  catch (error) {
+    return failure(503, VERIFICATION_UNAVAILABLE, verificationTimeout(error, options.signal) ? 'CAPTCHA_TIMEOUT' : 'CAPTCHA_RESPONSE_INVALID', 'not_sent', undefined, undefined, exceptionCategory(error));
+  }
+  if (!verification || typeof verification !== 'object' || Array.isArray(verification) || typeof verification.success !== 'boolean'
+    || (verification['error-codes'] !== undefined && (!Array.isArray(verification['error-codes']) || verification['error-codes'].some(code => typeof code !== 'string')))) {
+    return failure(503, VERIFICATION_UNAVAILABLE, 'CAPTCHA_RESPONSE_INVALID');
+  }
+  if (!verification.success) {
+    const codes = verification['error-codes'] || [];
+    if (codes.some(code => ['missing-input-secret', 'invalid-input-secret'].includes(code))) {
+      return failure(503, 'Verification is unavailable. Please contact Lavish directly.', 'CAPTCHA_CONFIGURATION_ERROR');
+    }
+    if (codes.includes('internal-error')) return failure(503, VERIFICATION_UNAVAILABLE, 'CAPTCHA_PROVIDER_ERROR');
+    return failure(403, 'Please complete the verification again before submitting.', 'CAPTCHA_TOKEN_INVALID');
+  }
+  if (verification.hostname !== hostname || verification.action !== 'contact') {
+    return failure(403, 'Please complete the verification again before submitting.', 'CAPTCHA_CONTEXT_MISMATCH');
+  }
+  return null;
+}
+
 async function sha256(value) {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
   return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
@@ -177,14 +244,16 @@ export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
           ? env.ASSETS.fetch(request)
           : new Response('Not found', { status: 404 });
       }
-      if (!['/api/contact', '/api/contact-config'].includes(url.pathname)) return failure(404, 'Not found.', 'NOT_FOUND');
+      if (!['/api/contact', '/api/contact-config', '/api/contact-verify'].includes(url.pathname)) return failure(404, 'Not found.', 'NOT_FOUND');
+      const verificationOnly = url.pathname === '/api/contact-verify';
+      if (verificationOnly && url.origin !== PREVIEW_ORIGIN) return failure(403, 'This request is not allowed.', 'ORIGIN_NOT_ALLOWED');
       const config = configuration(env);
       if (!config.origins) return failure(403, 'This request is not allowed.', 'CONFIG_NOT_READY');
       if (!config.origins.has(url.origin)) return failure(403, 'This request is not allowed.', 'ORIGIN_NOT_ALLOWED');
 
       if (url.pathname === '/api/contact-config') {
         if (request.method !== 'GET') return failure(405, 'Method not allowed.', 'METHOD_NOT_ALLOWED', 'not_sent', { Allow: 'GET' });
-        return json({ enabled: config.enabled, recipient: RECIPIENT, ...(config.enabled ? { siteKey: env.TURNSTILE_SITE_KEY } : {}) });
+        return json({ enabled: config.enabled, recipient: RECIPIENT, diagnosticsVersion: 2, ...(config.enabled ? { siteKey: env.TURNSTILE_SITE_KEY } : {}) });
       }
       if (request.method !== 'POST') return failure(405, 'Method not allowed.', 'METHOD_NOT_ALLOWED', 'not_sent', { Allow: 'POST' });
       if (request.headers.get('origin') !== url.origin
@@ -211,36 +280,12 @@ export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
         catch { return failure(503, UNAVAILABLE, 'RATE_LIMIT_BINDING_UNAVAILABLE'); }
         if (typeof rate?.success !== 'boolean') return failure(503, UNAVAILABLE, 'RATE_LIMIT_BINDING_UNAVAILABLE');
         if (!rate.success) return failure(429, 'Too many attempts. Please wait one minute or contact Lavish directly.', 'RATE_LIMITED', 'not_sent', { 'Retry-After': '60' });
-        const data = validate(await boundedJson(request));
-
-        let verification;
-        try {
-          const response = await fetchImpl('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ secret: env.TURNSTILE_SECRET_KEY, response: data.turnstileToken, remoteip: ip }),
-            // Workers supports manual/follow, not error. Never follow a redirect
-            // carrying a token/secret; the non-2xx check below rejects all 3xx.
-            redirect: 'manual',
-            signal: AbortSignal.timeout(8000),
-          });
-          if (!response.ok) return failure(503, 'Verification is unavailable. Please try again or contact Lavish directly.', 'CAPTCHA_UPSTREAM_UNAVAILABLE');
-          verification = await boundedJson(response, MAX_UPSTREAM_BYTES);
-        } catch { return failure(503, 'Verification is unavailable. Please try again or contact Lavish directly.', 'CAPTCHA_UPSTREAM_UNAVAILABLE'); }
-        if (verification?.success !== true) {
-          // Inspect only allowlisted error categories; never forward provider data.
-          const codes = Array.isArray(verification?.['error-codes']) ? verification['error-codes'] : [];
-          if (codes.some(code => ['missing-input-secret', 'invalid-input-secret'].includes(code))) {
-            return failure(503, 'Verification is unavailable. Please contact Lavish directly.', 'CAPTCHA_CONFIGURATION_ERROR');
-          }
-          if (codes.includes('internal-error')) {
-            return failure(503, 'Verification is unavailable. Please try again or contact Lavish directly.', 'CAPTCHA_UPSTREAM_UNAVAILABLE');
-          }
-          return failure(403, 'Please complete the verification again before submitting.', 'CAPTCHA_TOKEN_INVALID');
-        }
-        if (verification.hostname !== url.hostname || verification.action !== 'contact') {
-          return failure(403, 'Please complete the verification again before submitting.', 'CAPTCHA_CONTEXT_MISMATCH');
-        }
+        const body = await boundedJson(request);
+        const data = verificationOnly ? validateVerificationOnly(body) : validate(body);
+        const verificationFailure = await verifyTurnstile(data, ip, url.hostname, env, fetchImpl);
+        if (verificationFailure) return verificationFailure;
+        // Structurally exit before creating any email or reaching the Resend code.
+        if (verificationOnly) return json({ ok: true, verified: true, deliveryState: 'not_sent' });
 
         const payload = JSON.stringify(emailPayload(data, config.from));
         // Stable for unchanged entries + submission UUID, even after a fresh CAPTCHA.

@@ -29,12 +29,25 @@ const PRE_SEND_REASONS = Object.freeze({
   CAPTCHA_CONFIGURATION_ERROR: 'The security check is temporarily unavailable.',
   CAPTCHA_CONTEXT_MISMATCH: 'The security check could not verify this page.',
   CAPTCHA_UPSTREAM_UNAVAILABLE: 'The security check is temporarily unavailable.',
+  CAPTCHA_HTTP_ERROR: 'The security check is temporarily unavailable.',
+  CAPTCHA_REQUEST_ERROR: 'The security check is temporarily unavailable.',
+  CAPTCHA_FETCH_ERROR: 'The security check is temporarily unavailable.',
+  CAPTCHA_TIMEOUT: 'The security check took too long.',
+  CAPTCHA_RESPONSE_INVALID: 'The security check is temporarily unavailable.',
+  CAPTCHA_PROVIDER_ERROR: 'The security check is temporarily unavailable.',
   CAPTCHA_TOKEN_INVALID: 'The security check could not be verified. Please complete it again.'
 });
+export function safeFailureReference(result) {
+  if (!Object.hasOwn(PRE_SEND_REASONS, result?.code)) return '';
+  let reference = result.code;
+  if (result.code === 'CAPTCHA_HTTP_ERROR' && Number.isInteger(result.upstreamStatus) && result.upstreamStatus >= 100 && result.upstreamStatus <= 599) reference += ` (HTTP ${result.upstreamStatus})`;
+  if (['CAPTCHA_REQUEST_ERROR', 'CAPTCHA_FETCH_ERROR', 'CAPTCHA_TIMEOUT', 'CAPTCHA_RESPONSE_INVALID'].includes(result.code) && ['TypeError', 'RangeError', 'Error', 'AbortError', 'TimeoutError', 'OtherError'].includes(result.exceptionType)) reference += ` (${result.exceptionType})`;
+  return reference;
+}
 export function describeDeliveryFailure(result) {
   const code = result?.code;
   if (result?.deliveryState === 'not_sent' && Object.hasOwn(PRE_SEND_REASONS, code)) {
-    return `Your request was not sent. ${PRE_SEND_REASONS[code]} Your details are still here. Call 440-452-7240 or email sales@lavishtreeservice.com for help. Reference: ${code}.`;
+    return `Your request was not sent. ${PRE_SEND_REASONS[code]} Your details are still here. Call 440-452-7240 or email sales@lavishtreeservice.com for help. Reference: ${safeFailureReference(result)}.`;
   }
   if (result?.deliveryState === 'rejected' && code === 'RESEND_REJECTED') {
     return 'The email service did not accept your request. Your details are still here. Please call 440-452-7240 or email sales@lavishtreeservice.com. Reference: RESEND_REJECTED.';
