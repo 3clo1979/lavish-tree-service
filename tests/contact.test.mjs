@@ -325,6 +325,8 @@ for (const status of [400, 401, 403, 409, 429, 500, 503]) {
     assert.equal(response.status, 502);
     const result = await response.json();
     assert.equal(result.ok, false);
+    assert.equal(result.code, 'RESEND_REJECTED');
+    assert.equal(result.deliveryState, 'rejected');
     assert.match(result.error, /could not confirm/);
     assert.ok(!JSON.stringify(result).includes(f.env.RESEND_API_KEY));
     assert.equal(f.calls.length, 2); // No automatic retries.
@@ -342,6 +344,92 @@ for (const [name, fn] of [
     const f = fixture(); f.setSend(fn);
     const response = await f.worker.fetch(request(), f.env);
     assert.equal(response.status, 502);
-    assert.equal((await response.json()).ok, false);
+    const result = await response.json();
+    assert.equal(result.ok, false);
+    assert.equal(result.code, 'RESEND_RESULT_UNKNOWN');
+    assert.equal(result.deliveryState, 'unknown');
   });
 }
+
+for (const [name, options] of [
+  ['disabled configuration', { env: { CONTACT_FORM_ENABLED: 'false' }, status: 503, code: 'CONFIG_NOT_READY' }],
+  ['missing mail credential', { env: { RESEND_API_KEY: '' }, status: 503, code: 'CONFIG_NOT_READY' }],
+  ['invalid origin configuration', { env: { CONTACT_ALLOWED_ORIGINS: '*' }, status: 403, code: 'CONFIG_NOT_READY' }],
+  ['foreign origin', { request: { origin: 'https://attacker.example' }, status: 403, code: 'ORIGIN_NOT_ALLOWED' }],
+  ['unknown API route', { request: { path: '/api/missing' }, status: 404, code: 'NOT_FOUND' }],
+  ['wrong method', { request: { method: 'GET' }, status: 405, code: 'METHOD_NOT_ALLOWED' }],
+  ['wrong content type', { request: { headers: { 'Content-Type': 'text/plain' } }, status: 415, code: 'CONTENT_TYPE_UNSUPPORTED' }],
+  ['invalid input', { body: { name: '' }, status: 400, code: 'VALIDATION_FAILED' }],
+  ['malformed JSON', { request: { rawBody: '{bad' }, status: 400, code: 'VALIDATION_FAILED' }],
+  ['oversized JSON', { request: { rawBody: ' '.repeat(16_385) }, status: 413, code: 'BODY_TOO_LARGE' }],
+  ['missing platform IP', { request: { headers: { 'CF-Connecting-IP': null } }, status: 503, code: 'CLIENT_IP_UNAVAILABLE' }],
+  ['missing rate binding', { env: { CONTACT_RATE_LIMITER: undefined }, status: 503, code: 'RATE_LIMIT_BINDING_UNAVAILABLE' }],
+  ['failed rate binding', { env: { CONTACT_RATE_LIMITER: { async limit() { throw new Error('private binding failure'); } } }, status: 503, code: 'RATE_LIMIT_BINDING_UNAVAILABLE' }],
+  ['malformed rate result', { env: { CONTACT_RATE_LIMITER: { async limit() { return {}; } } }, status: 503, code: 'RATE_LIMIT_BINDING_UNAVAILABLE' }],
+  ['rate limited', { env: { CONTACT_RATE_LIMITER: { async limit() { return { success: false }; } } }, status: 429, code: 'RATE_LIMITED' }],
+  ['CAPTCHA HTTP failure', { verify: () => new Response('private provider failure', { status: 500 }), status: 503, code: 'CAPTCHA_UPSTREAM_UNAVAILABLE' }],
+  ['CAPTCHA connection failure', { verify: () => { throw new Error('private upstream error'); }, status: 503, code: 'CAPTCHA_UPSTREAM_UNAVAILABLE' }],
+  ['CAPTCHA bad JSON', { verify: () => new Response('{bad'), status: 503, code: 'CAPTCHA_UPSTREAM_UNAVAILABLE' }],
+  ['CAPTCHA internal error category', { verify: () => Response.json({ success: false, 'error-codes': ['internal-error'] }), status: 503, code: 'CAPTCHA_UPSTREAM_UNAVAILABLE' }],
+  ['CAPTCHA invalid secret category', { verify: () => Response.json({ success: false, 'error-codes': ['invalid-input-secret'] }), status: 503, code: 'CAPTCHA_CONFIGURATION_ERROR' }],
+  ['CAPTCHA missing secret category', { verify: () => Response.json({ success: false, 'error-codes': ['missing-input-secret'] }), status: 503, code: 'CAPTCHA_CONFIGURATION_ERROR' }],
+  ['CAPTCHA rejected token', { verify: () => Response.json({ success: false, 'error-codes': ['timeout-or-duplicate'] }), status: 403, code: 'CAPTCHA_TOKEN_INVALID' }],
+  ['CAPTCHA malformed error categories', { verify: () => Response.json({ success: false, 'error-codes': 'private provider data' }), status: 403, code: 'CAPTCHA_TOKEN_INVALID' }],
+  ['CAPTCHA hostname mismatch', { verify: () => Response.json({ success: true, hostname: 'other.example', action: 'contact' }), status: 403, code: 'CAPTCHA_CONTEXT_MISMATCH' }],
+  ['CAPTCHA action mismatch', { verify: () => Response.json({ success: true, hostname: HOST, action: 'other' }), status: 403, code: 'CAPTCHA_CONTEXT_MISMATCH' }],
+]) {
+  test(`safe diagnostic for ${name} is not_sent before Resend is invoked`, async () => {
+    const f = fixture(options.env);
+    if (options.verify) f.setVerify(options.verify);
+    const response = await f.worker.fetch(request({ ...sample(), ...options.body }, options.request), f.env);
+    assert.equal(response.status, options.status);
+    const result = await response.json();
+    assert.deepEqual(Object.keys(result).sort(), ['code', 'deliveryState', 'error', 'ok']);
+    assert.equal(result.ok, false);
+    assert.equal(result.code, options.code);
+    assert.equal(result.deliveryState, 'not_sent');
+    assert.ok(f.calls.every(call => call.url !== 'https://api.resend.com/emails'));
+    for (const privateValue of [sample().name, sample().email, sample().phone, sample().message, sample().turnstileToken, '192.0.2.1', 'private', f.env.RESEND_API_KEY, f.env.TURNSTILE_SECRET_KEY].filter(Boolean)) {
+      assert.ok(!JSON.stringify(result).includes(privateValue), `diagnostics must not expose ${privateValue}`);
+    }
+  });
+}
+
+test('unexpected request-stream exception is a private internal error before any send', async () => {
+  const f = fixture();
+  const original = request();
+  const broken = new Request(original.url, {
+    method: 'POST', headers: original.headers, duplex: 'half',
+    body: new ReadableStream({ start(controller) { controller.error(new Error('private request stream data')); } }),
+  });
+  const response = await f.worker.fetch(broken, f.env);
+  const result = await response.json();
+  assert.equal(response.status, 503);
+  assert.equal(result.code, 'INTERNAL_ERROR');
+  assert.equal(result.deliveryState, 'not_sent');
+  assert.ok(!JSON.stringify(result).includes('private'));
+  assert.equal(f.calls.length, 0);
+});
+
+test('a synchronous send-fetch exception remains unknown, never claims not_sent or rejected', async () => {
+  const f = fixture();
+  f.setSend(() => { throw new Error(`private ${f.env.RESEND_API_KEY} ${sample().email}`); });
+  const response = await f.worker.fetch(request(), f.env);
+  const result = await response.json();
+  assert.equal(result.code, 'RESEND_RESULT_UNKNOWN');
+  assert.equal(result.deliveryState, 'unknown');
+  assert.equal(f.calls.length, 2);
+  assert.ok(!JSON.stringify(result).includes('private'));
+  assert.ok(!JSON.stringify(result).includes(f.env.RESEND_API_KEY));
+  assert.ok(!JSON.stringify(result).includes(sample().email));
+});
+
+test('authorized empty-object diagnostic probe cannot invoke CAPTCHA or Resend', async () => {
+  const f=fixture();const response=await f.worker.fetch(request({}),f.env);const body=await response.json();
+  assert.equal(response.status,400);assert.equal(body.code,'VALIDATION_FAILED');assert.equal(body.deliveryState,'not_sent');assert.equal(f.calls.length,0);assert.equal(f.rateCalls.length,1);
+});
+test('empty-object diagnostic exposes a broken rate binding without any upstream call', async () => {
+  const f=fixture({CONTACT_RATE_LIMITER:{async limit(){throw new Error('mock binding error');}}});
+  const response=await f.worker.fetch(request({}),f.env);const body=await response.json();
+  assert.equal(response.status,503);assert.equal(body.code,'RATE_LIMIT_BINDING_UNAVAILABLE');assert.equal(body.deliveryState,'not_sent');assert.equal(f.calls.length,0);
+});

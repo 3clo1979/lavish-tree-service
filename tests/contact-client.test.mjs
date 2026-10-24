@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeConfig, serializeRequest, requestFingerprint, initializeContactForm } from '../src/contact-client.mjs';
+import { normalizeConfig, serializeRequest, requestFingerprint, describeDeliveryFailure, initializeContactForm } from '../src/contact-client.mjs';
 
 test('live client stays disabled unless server explicitly confirms all public readiness fields', () => {
   for (const config of [undefined, {}, { enabled: true }, { enabled: 'true', recipient: 'sales@lavishtreeservice.com', siteKey: 'valid_test_key_123' }, { enabled: true, recipient: 'wrong@example.com', siteKey: 'valid_test_key_123' }, { enabled: true, recipient: 'sales@lavishtreeservice.com', siteKey: '<script>' }]) assert.deepEqual(normalizeConfig(config), { enabled: false });
@@ -92,4 +92,25 @@ for (const [name, response] of [
   const h=harness(async()=>response); await initializeContactForm(h);
   h.window.widget.callback('mock-token'); await h.form.listener(h.event());
   assert.equal(h.form.resets, undefined); assert.match(h.status().textContent,/could not confirm/);
+});
+
+test('safe failure descriptions never claim no send without a recognized pre-provider code', () => {
+  assert.match(describeDeliveryFailure({code:'RATE_LIMIT_BINDING_UNAVAILABLE',deliveryState:'not_sent'}),/was not sent.*Reference: RATE_LIMIT_BINDING_UNAVAILABLE/);
+  assert.match(describeDeliveryFailure({code:'RESEND_REJECTED',deliveryState:'rejected'}),/did not accept/);
+  for(const value of [{code:'RESEND_RESULT_UNKNOWN',deliveryState:'unknown'},{code:'RESEND_REJECTED',deliveryState:'not_sent'},{code:'<script>',deliveryState:'not_sent'},{code:'constructor',deliveryState:'not_sent'},{}]){
+    const message=describeDeliveryFailure(value); assert.match(message,/could not confirm/); assert.ok(!message.includes('<script>'));
+  }
+});
+test('diagnostic response preserves entries and displays only the safe public reference',async()=>{
+  const h=harness(async()=>({ok:false,status:503,json:async()=>({ok:false,code:'RATE_LIMIT_BINDING_UNAVAILABLE',deliveryState:'not_sent',error:'raw upstream must not be shown'})}));
+  await initializeContactForm(h);h.window.widget.callback('mock-token');await h.form.listener(h.event());
+  assert.equal(h.form.resets,undefined);assert.match(h.status().textContent,/Reference: RATE_LIMIT_BINDING_UNAVAILABLE/);assert.ok(!h.status().textContent.includes('raw upstream'));
+  const notice=h.status().textContent;
+  h.window.widget['expired-callback']();h.window.widget.callback('new-token');
+  assert.equal(h.status().textContent,notice);assert.equal(h.status().hidden,false);
+});
+test('success notice survives later CAPTCHA expiration and refresh without another send',async()=>{
+  const h=harness();await initializeContactForm(h);h.window.widget.callback('mock-token');await h.form.listener(h.event());
+  const notice=h.status().textContent;h.window.widget['expired-callback']();h.window.widget.callback('new-token');
+  assert.equal(h.status().textContent,notice);assert.equal(h.status().hidden,false);assert.equal(h.requests.length,1);
 });

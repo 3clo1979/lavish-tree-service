@@ -15,7 +15,11 @@ const UNAVAILABLE = 'Online requests are unavailable right now. Please call Lavi
 const NOT_CONFIRMED = 'We could not confirm your request was accepted. Your details have been kept here. Please retry with the same details or contact Lavish directly.';
 
 class RequestError extends Error {
-  constructor(status, message) { super(message); this.status = status; }
+  constructor(status, message, code = 'VALIDATION_FAILED') {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
 }
 
 function json(value, status = 200, extraHeaders = {}) {
@@ -31,7 +35,13 @@ function json(value, status = 200, extraHeaders = {}) {
   });
 }
 
-function failure(status, error, headers) { return json({ ok: false, error }, status, headers); }
+// Codes are stable, public categories only. Never include input, credentials,
+// upstream error text, or raw exceptions in a response or diagnostic log.
+// `not_sent` is only safe before invoking Resend. An attempted send with no
+// conclusive response is `unknown`; only an observed non-2xx is `rejected`.
+function failure(status, error, code, deliveryState = 'not_sent', headers) {
+  return json({ ok: false, error, code, deliveryState }, status, headers);
+}
 function nonemptySetting(value, max = 256) {
   return typeof value === 'string' && value.length > 0 && value.length <= max && !/[\s\x00-\x1f\x7f]/.test(value);
 }
@@ -75,7 +85,7 @@ function configuration(env) {
 async function boundedJson(body, maximum = MAX_BODY_BYTES) {
   const length = body.headers.get('content-length');
   if (length !== null && (!/^\d+$/.test(length) || Number(length) > maximum)) {
-    throw new RequestError(413, 'This request is too large. Please shorten your details.');
+    throw new RequestError(413, 'This request is too large. Please shorten your details.', 'BODY_TOO_LARGE');
   }
   if (!body.body) throw new RequestError(400, 'Please provide your request details.');
   const reader = body.body.getReader();
@@ -88,7 +98,7 @@ async function boundedJson(body, maximum = MAX_BODY_BYTES) {
       size += value.byteLength;
       if (size > maximum) {
         await reader.cancel();
-        throw new RequestError(413, 'This request is too large. Please shorten your details.');
+        throw new RequestError(413, 'This request is too large. Please shorten your details.', 'BODY_TOO_LARGE');
       }
       chunks.push(value);
     }
@@ -167,33 +177,40 @@ export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
           ? env.ASSETS.fetch(request)
           : new Response('Not found', { status: 404 });
       }
-      if (!['/api/contact', '/api/contact-config'].includes(url.pathname)) return failure(404, 'Not found.');
+      if (!['/api/contact', '/api/contact-config'].includes(url.pathname)) return failure(404, 'Not found.', 'NOT_FOUND');
       const config = configuration(env);
-      if (!config.origins?.has(url.origin)) return failure(403, 'This request is not allowed.');
+      if (!config.origins) return failure(403, 'This request is not allowed.', 'CONFIG_NOT_READY');
+      if (!config.origins.has(url.origin)) return failure(403, 'This request is not allowed.', 'ORIGIN_NOT_ALLOWED');
 
       if (url.pathname === '/api/contact-config') {
-        if (request.method !== 'GET') return failure(405, 'Method not allowed.', { Allow: 'GET' });
+        if (request.method !== 'GET') return failure(405, 'Method not allowed.', 'METHOD_NOT_ALLOWED', 'not_sent', { Allow: 'GET' });
         return json({ enabled: config.enabled, recipient: RECIPIENT, ...(config.enabled ? { siteKey: env.TURNSTILE_SITE_KEY } : {}) });
       }
-      if (request.method !== 'POST') return failure(405, 'Method not allowed.', { Allow: 'POST' });
+      if (request.method !== 'POST') return failure(405, 'Method not allowed.', 'METHOD_NOT_ALLOWED', 'not_sent', { Allow: 'POST' });
       if (request.headers.get('origin') !== url.origin
         || (request.headers.has('sec-fetch-site') && request.headers.get('sec-fetch-site') !== 'same-origin')) {
-        return failure(403, 'This request is not allowed.');
+        return failure(403, 'This request is not allowed.', 'ORIGIN_NOT_ALLOWED');
       }
       if (!/^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(request.headers.get('content-type') || '')
         || (request.headers.has('content-encoding') && request.headers.get('content-encoding') !== 'identity')) {
-        return failure(415, 'Please submit this request through the website form.');
+        return failure(415, 'Please submit this request through the website form.', 'CONTENT_TYPE_UNSUPPORTED');
       }
-      if (!config.enabled) return failure(503, UNAVAILABLE);
+      if (!config.enabled) {
+        const code = env.CONTACT_FORM_ENABLED === 'true' && typeof env.CONTACT_RATE_LIMITER?.limit !== 'function'
+          ? 'RATE_LIMIT_BINDING_UNAVAILABLE' : 'CONFIG_NOT_READY';
+        return failure(503, UNAVAILABLE, code);
+      }
 
+      let sendAttempted = false;
       try {
         // Cloudflare supplies this header. Never trust X-Forwarded-For as a fallback.
         const ip = request.headers.get('cf-connecting-ip');
-        if (!ip || ip.length > 45 || !/^[\da-fA-F:.]+$/.test(ip)) return failure(503, UNAVAILABLE);
+        if (!ip || ip.length > 45 || !/^[\da-fA-F:.]+$/.test(ip)) return failure(503, UNAVAILABLE, 'CLIENT_IP_UNAVAILABLE');
         let rate;
         try { rate = await env.CONTACT_RATE_LIMITER.limit({ key: `lavish-contact:${await sha256(ip)}` }); }
-        catch { return failure(503, UNAVAILABLE); }
-        if (rate?.success !== true) return failure(429, 'Too many attempts. Please wait one minute or contact Lavish directly.', { 'Retry-After': '60' });
+        catch { return failure(503, UNAVAILABLE, 'RATE_LIMIT_BINDING_UNAVAILABLE'); }
+        if (typeof rate?.success !== 'boolean') return failure(503, UNAVAILABLE, 'RATE_LIMIT_BINDING_UNAVAILABLE');
+        if (!rate.success) return failure(429, 'Too many attempts. Please wait one minute or contact Lavish directly.', 'RATE_LIMITED', 'not_sent', { 'Retry-After': '60' });
         const data = validate(await boundedJson(request));
 
         let verification;
@@ -205,11 +222,22 @@ export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
             redirect: 'error',
             signal: AbortSignal.timeout(8000),
           });
-          if (!response.ok) return failure(503, 'Verification is unavailable. Please try again or contact Lavish directly.');
+          if (!response.ok) return failure(503, 'Verification is unavailable. Please try again or contact Lavish directly.', 'CAPTCHA_UPSTREAM_UNAVAILABLE');
           verification = await boundedJson(response, MAX_UPSTREAM_BYTES);
-        } catch { return failure(503, 'Verification is unavailable. Please try again or contact Lavish directly.'); }
-        if (verification?.success !== true || verification.hostname !== url.hostname || verification.action !== 'contact') {
-          return failure(403, 'Please complete the verification again before submitting.');
+        } catch { return failure(503, 'Verification is unavailable. Please try again or contact Lavish directly.', 'CAPTCHA_UPSTREAM_UNAVAILABLE'); }
+        if (verification?.success !== true) {
+          // Inspect only allowlisted error categories; never forward provider data.
+          const codes = Array.isArray(verification?.['error-codes']) ? verification['error-codes'] : [];
+          if (codes.some(code => ['missing-input-secret', 'invalid-input-secret'].includes(code))) {
+            return failure(503, 'Verification is unavailable. Please contact Lavish directly.', 'CAPTCHA_CONFIGURATION_ERROR');
+          }
+          if (codes.includes('internal-error')) {
+            return failure(503, 'Verification is unavailable. Please try again or contact Lavish directly.', 'CAPTCHA_UPSTREAM_UNAVAILABLE');
+          }
+          return failure(403, 'Please complete the verification again before submitting.', 'CAPTCHA_TOKEN_INVALID');
+        }
+        if (verification.hostname !== url.hostname || verification.action !== 'contact') {
+          return failure(403, 'Please complete the verification again before submitting.', 'CAPTCHA_CONTEXT_MISMATCH');
         }
 
         const payload = JSON.stringify(emailPayload(data, config.from));
@@ -218,7 +246,7 @@ export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
         const idempotencyKey = `lavish-contact/${await sha256(`${data.submissionId.toLowerCase()}\n${payload}`)}`;
         let response;
         try {
-          response = await fetchImpl('https://api.resend.com/emails', {
+          const sendOptions = {
             method: 'POST',
             headers: {
               Authorization: `Bearer ${env.RESEND_API_KEY}`,
@@ -228,16 +256,23 @@ export function createContactWorker({ fetchImpl = globalThis.fetch } = {}) {
             body: payload,
             redirect: 'error',
             signal: AbortSignal.timeout(10000),
-          });
-          if (!response.ok) return failure(502, NOT_CONFIRMED);
+          };
+          sendAttempted = true;
+          response = await fetchImpl('https://api.resend.com/emails', sendOptions);
+          if (!response.ok) return failure(502, NOT_CONFIRMED, 'RESEND_REJECTED', 'rejected');
           const result = await boundedJson(response, MAX_UPSTREAM_BYTES);
-          if (!result || typeof result.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(result.id)) return failure(502, NOT_CONFIRMED);
+          if (!result || typeof result.id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(result.id)) return failure(502, NOT_CONFIRMED, 'RESEND_RESULT_UNKNOWN', 'unknown');
           // This confirms provider acceptance, not mailbox delivery or appointment booking.
           return json({ ok: true, requestId: result.id }, 202);
-        } catch { return failure(502, NOT_CONFIRMED); }
+        } catch {
+          return sendAttempted
+            ? failure(502, NOT_CONFIRMED, 'RESEND_RESULT_UNKNOWN', 'unknown')
+            : failure(503, UNAVAILABLE, 'INTERNAL_ERROR');
+        }
       } catch (error) {
-        if (error instanceof RequestError) return failure(error.status, error.message);
-        return failure(503, UNAVAILABLE);
+        if (sendAttempted) return failure(502, NOT_CONFIRMED, 'RESEND_RESULT_UNKNOWN', 'unknown');
+        if (error instanceof RequestError) return failure(error.status, error.message, error.code);
+        return failure(503, UNAVAILABLE, 'INTERNAL_ERROR');
       }
     },
   };

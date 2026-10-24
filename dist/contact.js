@@ -13,6 +13,35 @@ export function requestFingerprint(values) {
   return JSON.stringify(KEYS.map(key => values[key] || ''));
 }
 
+const UNSURE = 'We could not confirm your request was sent. Your details are still here. Please call 440-452-7240 or email sales@lavishtreeservice.com before trying again.';
+const PRE_SEND_REASONS = Object.freeze({
+  CONFIG_NOT_READY: 'Online requests are temporarily unavailable.',
+  ORIGIN_NOT_ALLOWED: 'This page could not submit the request. Please reload it.',
+  VALIDATION_FAILED: 'Please check your contact details and project information.',
+  BODY_TOO_LARGE: 'Please shorten your project details.',
+  CLIENT_IP_UNAVAILABLE: 'Online requests are temporarily unavailable.',
+  RATE_LIMIT_BINDING_UNAVAILABLE: 'Online requests are temporarily unavailable.',
+  RATE_LIMITED: 'Too many attempts. Please wait one minute.',
+  INTERNAL_ERROR: 'Online requests are temporarily unavailable.',
+  NOT_FOUND: 'The request endpoint is unavailable.',
+  METHOD_NOT_ALLOWED: 'This page could not submit the request. Please reload it.',
+  CONTENT_TYPE_UNSUPPORTED: 'This page could not submit the request. Please reload it.',
+  CAPTCHA_CONFIGURATION_ERROR: 'The security check is temporarily unavailable.',
+  CAPTCHA_CONTEXT_MISMATCH: 'The security check could not verify this page.',
+  CAPTCHA_UPSTREAM_UNAVAILABLE: 'The security check is temporarily unavailable.',
+  CAPTCHA_TOKEN_INVALID: 'The security check could not be verified. Please complete it again.'
+});
+export function describeDeliveryFailure(result) {
+  const code = result?.code;
+  if (result?.deliveryState === 'not_sent' && Object.hasOwn(PRE_SEND_REASONS, code)) {
+    return `Your request was not sent. ${PRE_SEND_REASONS[code]} Your details are still here. Call 440-452-7240 or email sales@lavishtreeservice.com for help. Reference: ${code}.`;
+  }
+  if (result?.deliveryState === 'rejected' && code === 'RESEND_REJECTED') {
+    return 'The email service did not accept your request. Your details are still here. Please call 440-452-7240 or email sales@lavishtreeservice.com. Reference: RESEND_REJECTED.';
+  }
+  return UNSURE + (code === 'RESEND_RESULT_UNKNOWN' && result?.deliveryState === 'unknown' ? ' Reference: RESEND_RESULT_UNKNOWN.' : '');
+}
+
 export async function initializeContactForm({ document, window, fetch = window.fetch.bind(window) }) {
   const form = document.querySelector('#quote-form');
   const submit = form?.querySelector('.form-submit');
@@ -97,17 +126,21 @@ export async function initializeContactForm({ document, window, fetch = window.f
     setStatus('Sending your request. Please keep this page open.');
     const controller = new window.AbortController();
     const timeout = window.setTimeout(() => controller.abort(), 20000);
+    let failureMessage = UNSURE;
     try {
       const response = await fetch('/api/contact', {
         method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify({ ...values, turnstileToken: token, submissionId }), signal: controller.signal
       });
       const result = await response.json();
-      if (response.status !== 202 || result?.ok !== true || typeof result.requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(result.requestId)) throw new Error('Request acceptance was not confirmed');
-      setStatus('Thank you — your request is on its way to Lavish. For urgent concerns, call 440-452-7240.', true);
+      if (response.status !== 202 || result?.ok !== true || typeof result.requestId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(result.requestId)) {
+        failureMessage = describeDeliveryFailure(result);
+        throw new Error('Request acceptance was not confirmed');
+      }
+      setStatus('Thank you — your request is on its way to Lavish. For urgent concerns, call 440-452-7240.', true, 'delivery');
       form.reset();
     } catch {
-      setStatus('We could not confirm your request was sent. Your details are still here. Please try again, call 440-452-7240, or email sales@lavishtreeservice.com.', true);
+      setStatus(failureMessage, true, 'delivery');
     } finally {
       window.clearTimeout(timeout);
       pending = false;
@@ -121,8 +154,8 @@ export async function initializeContactForm({ document, window, fetch = window.f
       widgetId = window.turnstile.render(security, {
         sitekey: config.siteKey, action: 'contact', theme: 'dark', size: 'flexible',
         callback: value => { token = value; refreshButton(); if (!pending && statusMode === 'security') status.hidden = true; },
-        'expired-callback': () => { token = ''; refreshButton(); setStatus('The security check expired. Please complete it again.', false, 'security'); },
-        'error-callback': () => { token = ''; refreshButton(); setStatus('The security check could not complete. Please try again, or call or email Lavish.', false, 'security'); }
+        'expired-callback': () => { token = ''; refreshButton(); if (statusMode !== 'delivery') setStatus('The security check expired. Please complete it again.', false, 'security'); },
+        'error-callback': () => { token = ''; refreshButton(); if (statusMode !== 'delivery') setStatus('The security check could not complete. Please try again, or call or email Lavish.', false, 'security'); }
       });
     } catch { setStatus('The security check is unavailable. Please call or email Lavish.'); }
   };
