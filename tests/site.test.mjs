@@ -84,3 +84,11 @@ test('hero features the original large logo and exact neighborhood slogan', () =
   assert.ok(css.includes('.hero-brand>img{width:200px;height:200px'));
   assert.ok(css.includes('.hero-brand>img{width:150px;height:150px'));
 });
+
+test('contact form is permanently visible without an accordion or extra disclosure action', () => {
+  assert.ok(!/<(?:details|summary)\b/.test(html));
+  assert.ok(html.includes('class="quote-card" id="quote"'));
+  assert.ok(html.includes('TELL US ABOUT YOUR PROJECT'));
+  assert.ok(html.includes('<form id="quote-form"'));
+  assert.ok(html.includes('Design preview only.'));
+});
