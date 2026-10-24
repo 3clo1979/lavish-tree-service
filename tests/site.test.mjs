@@ -64,3 +64,16 @@ test('deployment identity unchanged', () => {
   assert.equal(config.name, 'lavish-tree-service'); assert.equal(config.assets.directory, './dist');
   assert.equal(config.routes, undefined); assert.equal(config.route, undefined);
 });
+
+test('section, gallery and service labels use semantic SVG icons, not numbering', () => {
+  assert.ok(!html.includes('service-number'));
+  assert.ok(!/0[1-4] (?:—|\/)/.test(html));
+  for (const name of ['chainsaw', 'tree', 'removal', 'pruning', 'stump', 'storm']) assert.ok(html.includes(`id="i-${name}"`), name);
+  for (const m of html.matchAll(/<svg class="icon service-icon"[^>]*>/g)) assert.ok(m[0].includes('aria-hidden="true"'));
+  assert.equal([...html.matchAll(/class="icon service-icon"/g)].length, 4);
+});
+test('meaningful telephone numbers and gallery position counts remain intact', () => {
+  assert.ok(html.includes('440-452-7240'));
+  assert.ok(html.includes('id="gallery-count" aria-live="polite">1 / 3'));
+  assert.ok(js.includes('${photoIndex + 1} / ${photos.length}'));
+});
