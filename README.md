@@ -1,38 +1,41 @@
-# Lavish Tree Service — Camyta redesign
+# Lavish Tree Service — industrial redesign
 
-Static, dependency-free design preview for Lavish Tree Service. Built for Cloudflare Pages or Workers Static Assets. The existing live domain and email are **not** connected or changed by this package.
+A short, photography-led static design preview for Lavish Tree Service. The October 24 redesign replaces the earlier cream/forest split layout with charcoal, white, safety orange, oversized condensed type, and authentic tree work. It is deliberately distinct from the Best Buds lawn-care site.
 
-## Preview status
+## Experience
 
-- Responsive HTML/CSS/JavaScript, self-hosted original logo/photos/fonts, project-photo lightbox, mobile navigation, service selection, and click-to-call links.
-- Quote form deliberately previews a request only. **Nothing is sent or stored.** No recipient, backend, analytics, CRM, or email credentials are configured.
-- Search crawling is blocked with robots.txt, HTML robots metadata, and X-Robots-Tag. Remove these only for the approved production launch.
-- 12 static/DOM behavior checks passed. Browser-rendered desktop/mobile QA remains required after a reachable preview deployment.
+- Large crane-removal introduction using an authentic Lavish Facebook photograph.
+- Prominent general contact and 24-hour emergency click-to-call actions: **440-452-7240**.
+- Persistent call / emergency actions on phones, compact mobile navigation, and visible Facebook work links in navigation, work, contact, and footer.
+- Three original project photos with accessible, keyboard-operated enlargement and previous/next controls.
+- Compact services and large contact details, including the publicly verified sales@lavishtreeservice.com address.
+- An optional request-planning form preserves the earlier preview feature. **Nothing is sent or stored.** It is explicitly labeled preview-only and remains disabled without JavaScript. Real inquiries go through telephone or email links.
+- Self-hosted images and fonts; no analytics, remote embeds, runtime dependencies, or new credentials.
 
-## Cloudflare Pages
+See `ASSETS.md` for photo provenance. No synthetic project imagery or invented credentials are used. Availability language is sourced from both the existing public website and matching Facebook page; no response-time guarantee is added.
 
-Create a Pages project from this repository. Choose no framework. No build command is needed; output directory: `dist`. Use the generated pages.dev hostname for review. Do not add the live custom domain yet.
+## Run and validate
 
-## Cloudflare Workers Static Assets
+There is no build step. `dist/` is the deployable static output.
 
-A minimal `wrangler.jsonc` is included. The assets directory is `./dist`; no Worker code or secrets are required. From an authorized Cloudflare account, deploy with Wrangler or import the repository through Workers & Pages. Do not configure a custom domain or route until separately approved.
+```sh
+npm run check
+python -m http.server 8080 --directory dist
+```
+
+`npm run check` checks JavaScript syntax and runs twelve static integrity tests. It is not a substitute for rendered desktop/mobile and interaction QA. See `QA.md` for the actual verification record and any environment limits.
+
+## Deployment boundary
+
+The existing `wrangler.jsonc` keeps the service name `lavish-tree-service` and serves `./dist`. Git-connected Cloudflare Workers deployment is intended only for the existing preview endpoint. No custom routes are added.
+
+The live **lavishtreeservice.com** site, Namecheap registration, and Private Email DNS are not changed. Preview crawling remains blocked in HTML, robots.txt, and response headers. No live form backend is connected.
 
 ## Before production
 
-1. Complete desktop and mobile browser QA, keyboard/dialog checks, contrast and tap-target review, and real-device phone-link checks.
-2. Confirm approved copy, original-logo export rights, ownership of the reused photos, exact service area, and current availability of 24-hour emergency service. Existing logo artwork includes “Est. 2002”; no additional credential, rating, or experience claim is added.
-3. Confirm the quote recipient and build a secure, spam-protected form delivery path. Replace the explicit preview-only UI only after real delivery is verified. Update CSP `connect-src` and `form-action` narrowly to the actual integration.
-4. Keep Namecheap registration and Private Email intact. A complete DNS-zone export and explicit cutover approval are required. Preserve MX, SPF, DKIM, SRV, and mail convenience hostnames.
-5. Confirm live canonical/OG metadata, add a social preview image and sitemap, structured business metadata using confirmed facts, and production privacy disclosures. Remove preview crawl blocks, then test the resulting indexability.
-6. Support valid HTTPS at both apex and www. The legacy `/page` and `/home` routes redirect to `/` in this package. Inventory any additional routes before cutover.
-7. Keep the Design.com site available for rollback. Do not cancel services without separate approval.
-
-## Assets and licenses
-
-Business logo and six project photographs are preserved from the owner's existing public website, https://lavishtreeservice.com, retrieved October 22, 2026. Photos were resized and converted to WebP; no synthetic jobsite images are used. Original assets remain the property of their respective owner and are not relicensed by this repository.
-
-Camyta footer mark is supplied from the existing Camyta project; footer links to https://camytagroup.com.
-
-DM Sans and Fraunces fonts are self-hosted. Their SIL Open Font License texts are included in `licenses/`.
-
-No raw website snapshot, private research notes, DNS inventory, tokens, account credentials, or user messages are included in this release.
+1. Confirm business copy, current emergency availability, and final photos with the owner.
+2. Complete mobile device, accessibility, and phone/email handoff tests.
+3. Obtain the approved form recipient and build a secure spam-protected delivery path only if requested. Verify actual delivery before removing preview labels.
+4. Require explicit cutover approval and a complete DNS export. Preserve MX, SPF, DKIM, SRV, and mail hostnames. Keep Design.com available for rollback; do not cancel services.
+5. Confirm canonical/OG metadata and privacy disclosures, add production sitemap/schema, then remove preview crawl blocks only for the approved launch.
+6. Support valid HTTPS at apex and www. Preserve `/page` and `/home` redirects and inventory any additional legacy routes before cutover.
